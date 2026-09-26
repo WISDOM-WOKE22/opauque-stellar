@@ -1,0 +1,28 @@
+name: Install cargo audit tooling
+description: >-
+  Installs pinned, prebuilt cargo-audit and cargo-deny binaries (via
+  taiki-e/install-action) instead of compiling them from source on every run.
+  This is the single place the tool versions are pinned; bump them here.
+
+inputs:
+  audit:
+    description: Install cargo-audit
+    default: "true"
+  deny:
+    description: Install cargo-deny
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install cargo-audit 0.22.2 (prebuilt)
+      if: inputs.audit == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit@0.22.2
+
+    - name: Install cargo-deny 0.20.2 (prebuilt)
+      if: inputs.deny == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny@0.20.2

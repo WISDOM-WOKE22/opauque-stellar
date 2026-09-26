@@ -15,10 +15,14 @@ on:
       - "frontend/**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   a11y-audit:
     name: axe-core audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

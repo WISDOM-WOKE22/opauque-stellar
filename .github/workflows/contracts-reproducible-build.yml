@@ -30,10 +30,14 @@ on:
       - "docker/reproducible-build.Dockerfile"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   reproducible-build:
     name: Build contracts in pinned image and verify WASM hashes
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

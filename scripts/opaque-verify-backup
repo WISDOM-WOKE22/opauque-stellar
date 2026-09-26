@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# opaque-verify-backup: automated restore verification for opaque-backup output.
+# Documented in docs/state-backups.md. Install to /usr/local/bin/opaque-verify-backup.
+#
+# For each service, decrypts the newest backup, fully extracts it into a temp
+# directory, and requires the result to be non-empty. Exits 1 on any failure.
+#
+# Environment: OPAQUE_BACKUP_DIR, OPAQUE_BACKUP_PASSPHRASE_FILE (as opaque-backup).
+# The relayer is verified only when RELAYER_DATA_DIR is set (the relayer node
+# persists nothing; only the hub, when configured, writes state).
+set -euo pipefail
+umask 077
+
+BACKUP_ROOT="${OPAQUE_BACKUP_DIR:-/var/backups/opaque}"
+PASSPHRASE_FILE="${OPAQUE_BACKUP_PASSPHRASE_FILE:-/etc/opaque/backup-passphrase}"
+RESTORE_TMP=$(mktemp -d)
+trap 'rm -rf "$RESTORE_TMP"' EXIT
+
+services=(asp publisher)
+if [[ -n "${RELAYER_DATA_DIR:-}" ]]; then
+  services+=(relayer)
+fi
+
+FAILURES=0
+for service in "${services[@]}"; do
+  # Timestamps are UTC and sortable, so name order is chronological order.
+  latest=$(ls "$BACKUP_ROOT/${service}"-*.tar.gz.gpg 2>/dev/null | sort | tail -1 || true)
+  if [[ -z "$latest" ]]; then
+    echo "FAIL: no backup found for $service"
+    FAILURES=$((FAILURES + 1))
+    continue
+  fi
+
+  dest="$RESTORE_TMP/$service"
+  mkdir -p "$dest"
+  if gpg --batch --pinentry-mode loopback --passphrase-file "$PASSPHRASE_FILE" \
+         --decrypt "$latest" 2>/dev/null \
+       | tar -xzf - -C "$dest" 2>/dev/null \
+     && [[ -n "$(ls -A "$dest")" ]]; then
+    echo "OK: $service - $(basename "$latest") restores cleanly"
+  else
+    echo "FAIL: $service - $(basename "$latest") failed restore verification"
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+
+if [[ $FAILURES -gt 0 ]]; then
+  echo "Backup verification: $FAILURES failure(s)" >&2
+  exit 1
+fi
+echo "Backup verification: all services OK"

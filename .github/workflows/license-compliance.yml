@@ -26,10 +26,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   cargo-license-check:
     name: cargo deny check licenses
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -46,8 +50,10 @@ jobs:
             scanner/target
           key: ${{ runner.os }}-license-cargo-${{ hashFiles('Cargo.lock', 'scanner/Cargo.lock') }}
 
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+      - name: Install cargo-deny (pinned prebuilt)
+        uses: ./.github/actions/install-audit-tools
+        with:
+          audit: "false"
 
       - name: cargo deny check licenses (contracts workspace)
         run: cargo deny check licenses
@@ -59,6 +65,7 @@ jobs:
   notices-check:
     name: THIRD_PARTY_NOTICES verification
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
