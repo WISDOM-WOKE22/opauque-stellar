@@ -12,7 +12,7 @@ export interface PolicyDecision {
   policy: string;
   deposit: Deposit;
   verdict: PolicyVerdict;
-  reason?: string;
+  reason: string;
   timestamp: string;
 }
 
@@ -53,27 +53,32 @@ export class PolicyEngine {
   }
 
   async screen(deposit: Deposit): Promise<PolicyVerdict> {
+    return (await this.evaluate(deposit)).verdict;
+  }
+
+  async evaluate(deposit: Deposit): Promise<{ verdict: PolicyVerdict; decisions: PolicyDecision[] }> {
     const results: PolicyDecision[] = [];
     const ts = new Date().toISOString();
 
     for (const policy of this.policies) {
       const verdict = await policy.screen(deposit);
-      const decision: PolicyDecision = { policy: policy.name, deposit, verdict, timestamp: ts };
+      const reason = policy.reason?.(deposit) ?? `policy returned ${verdict}`;
+      const decision: PolicyDecision = { policy: policy.name, deposit, verdict, reason, timestamp: ts };
       results.push(decision);
       if (this.onDecision) this.onDecision(decision);
     }
 
     switch (this.strategy) {
       case "any-approve":
-        return results.some((r) => r.verdict === "approve") ? "approve" : "reject";
+        return { verdict: results.some((r) => r.verdict === "approve") ? "approve" : results.some((r) => r.verdict === "defer") ? "defer" : "reject", decisions: results };
       case "all-must-approve":
-        return results.every((r) => r.verdict === "approve") ? "approve" : "reject";
+        return { verdict: results.some((r) => r.verdict === "reject") ? "reject" : results.every((r) => r.verdict === "approve") ? "approve" : "defer", decisions: results };
       case "first-decides":
       default:
         for (const r of results) {
-          if (r.verdict !== "defer") return r.verdict;
+          if (r.verdict !== "defer") return { verdict: r.verdict, decisions: results };
         }
-        return "defer";
+        return { verdict: "defer", decisions: results };
     }
   }
 }

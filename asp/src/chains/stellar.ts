@@ -93,11 +93,16 @@ export class StellarChainAdapter implements ChainAdapter {
         .setTimeout(30)
         .build();
       const sim = await this.server.simulateTransaction(tx);
-      if (rpc.Api.isSimulationError(sim) || !sim.result?.retval) return null;
+      if (rpc.Api.isSimulationError(sim)) {
+        const text = JSON.stringify(sim);
+        if (text.includes(state ? "UnknownStateRoot" : "UnknownAspRoot")) return null;
+        throw new Error(`simulation failed while reading ${state ? "state" : "ASP"} root`);
+      }
+      if (!sim.result?.retval) throw new Error(`missing ${state ? "state" : "ASP"} root simulation result`);
       const native = scValToNative(sim.result.retval);
       return "0x" + Buffer.from(native).toString("hex");
-    } catch {
-      return null;
+    } catch (err) {
+      throw new Error(`RPC read failed while reading ${state ? "state" : "ASP"} root`, { cause: err });
     }
   }
 
@@ -189,11 +194,27 @@ export class StellarChainAdapter implements ChainAdapter {
     return this.postRoot(true, root, datasetHash);
   }
 
-  async readStateLeaves(): Promise<StateTreeSnapshot> {
-    const startLedger = await this.resolveEventStartLedger(0);
+  async readStateLeaves(fromLedger = 0): Promise<StateTreeSnapshot> {
+    const health = await this.server.getHealth();
+    const oldestLedger = Number(health.oldestLedger);
+    if (fromLedger > 0 && fromLedger < oldestLedger) {
+      throw new Error(`state event retention gap: cursor ${fromLedger} is older than RPC oldest ledger ${oldestLedger}`);
+    }
+    let startLedger = fromLedger;
+    if (startLedger === 0) {
+      const latest = await this.latestLedger();
+      const lookback = this.cfg.lookback ?? 16000;
+      startLedger = this.cfg.deploymentLedger && this.cfg.deploymentLedger > 0
+        ? this.cfg.deploymentLedger
+        : Math.max(1, latest - lookback);
+      if (startLedger < oldestLedger) {
+        throw new Error(`state event retention gap: required start ${startLedger} is older than RPC oldest ledger ${oldestLedger}`);
+      }
+    }
     const depositTopic = xdr.ScVal.scvSymbol("Deposit").toXDR("base64");
     const withdrawTopic = xdr.ScVal.scvSymbol("Withdraw").toXDR("base64");
     const byIndex = new Map<number, string>();
+    const events: Array<{ index: number; leaf: string }> = [];
     let eventCount = 0;
 
     for (const [topic, isDeposit] of [
@@ -209,12 +230,14 @@ export class StellarChainAdapter implements ChainAdapter {
       for (let page = 0; page < 400; page++) {
         const res = cursor
           ? await this.server.getEvents({ cursor, filters, limit: 100 })
-          : await this.getEventsFrom(startLedger, filters);
+          : await this.server.getEvents({ startLedger, filters, limit: 100 });
         for (const ev of res.events ?? []) {
           const data = scValToNative(ev.value);
           const commitment = isDeposit ? data[0] : data[1];
           const index = Number(isDeposit ? data[1] : data[2]);
-          byIndex.set(index, "0x" + Buffer.from(commitment).toString("hex"));
+          const leaf = "0x" + Buffer.from(commitment).toString("hex");
+          byIndex.set(index, leaf);
+          events.push({ index, leaf });
           eventCount++;
         }
         cursor = res.cursor;
@@ -228,6 +251,6 @@ export class StellarChainAdapter implements ChainAdapter {
     for (let i = 0; i <= maxIndex; i++) {
       leaves.push(byIndex.get(i) ?? `0x${"00".repeat(32)}`);
     }
-    return { leaves, eventCount, maxIndex };
+    return { leaves, eventCount, maxIndex, events, cursor: await this.latestLedger() };
   }
 }

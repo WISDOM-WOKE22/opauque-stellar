@@ -84,6 +84,7 @@ describe("dataset hash", () => {
     const b = [bigintToHex32(2n), bigintToHex32(1n)];
     expect(computeDatasetHash(root, a)).toBe(computeDatasetHash(root, a));
     expect(computeDatasetHash(root, a)).not.toBe(computeDatasetHash(root, b));
+    expect(computeDatasetHash(`0x${"11".repeat(32)}`, [bigintToHex32(1n), bigintToHex32(2n)])).toBe("0xe22e40d771557c5cda2b8d65d1858102658145607aacdd5600a1d4dd54b78896");
   });
 });
 

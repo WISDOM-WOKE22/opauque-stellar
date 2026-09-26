@@ -15,7 +15,8 @@ import { computeDatasetHash, writeManifest } from "./publish.ts";
 import { PublicationMonitor } from "./monitor.ts";
 import { ReorgGuard } from "./reorg-guard.ts";
 import type { Store } from "./store.ts";
-import type { ChainAdapter, Policy, PoolState } from "./types.ts";
+import type { ChainAdapter, Policy, PoolState, PolicyDecisionRecord } from "./types.ts";
+import { PolicyEngine } from "./policy-engine.ts";
 
 export interface TickConfig {
   poolId: string;
@@ -56,7 +57,7 @@ export interface TickResult {
 }
 
 function initState(poolId: string, scope: number): PoolState {
-  return { poolId, scope, approvedIndices: [], rejectedIndices: [], deferredIndices: [], lastIndex: -1, lastLedger: 0 };
+  return { poolId, scope, approvedIndices: [], rejectedIndices: [], deferredIndices: [], decisions: [], lastIndex: -1, lastLedger: 0 };
 }
 
 export async function runPoolTick(cfg: TickConfig): Promise<TickResult> {
@@ -64,6 +65,7 @@ export async function runPoolTick(cfg: TickConfig): Promise<TickResult> {
   const state = cfg.store.load(cfg.poolId) ?? initState(cfg.poolId, cfg.scope);
   state.rejectedIndices ??= [];
   state.deferredIndices ??= [];
+  state.decisions ??= [];
 
   // 1. Read finalized deposits and screen any index without a terminal decision.
   const readAfterIndex = state.deferredIndices.length > 0 ? -1 : state.lastIndex;
@@ -75,7 +77,17 @@ export async function runPoolTick(cfg: TickConfig): Promise<TickResult> {
   const nextDeferred = new Set<number>();
   for (const dep of deposits) {
     if (approved.has(dep.index) || rejected.has(dep.index)) continue;
-    const verdict = await cfg.policy.screen(dep);
+    const evaluated = cfg.policy instanceof PolicyEngine
+      ? await cfg.policy.evaluate(dep)
+      : await (async () => {
+          const screened = await cfg.policy.screen(dep);
+          return { verdict: screened, decisions: [{ policy: cfg.policy.name, deposit: dep, verdict: screened, reason: cfg.policy.reason?.(dep) ?? `policy returned ${screened}`, timestamp: now() }] };
+        })();
+    const verdict = evaluated.verdict;
+    for (const decision of evaluated.decisions) {
+      const record: PolicyDecisionRecord = { depositIndex: dep.index, policy: decision.policy, verdict: decision.verdict, reason: decision.reason, timestamp: decision.timestamp };
+      state.decisions.push(record);
+    }
     if (verdict === "approve") {
       state.approvedIndices.push(dep.index);
       approved.add(dep.index);
@@ -128,7 +140,7 @@ export async function runPoolTick(cfg: TickConfig): Promise<TickResult> {
   if (set.size > 0 && localRoot !== onChainRoot) {
     const manifest = set.manifest(cfg.poolId, now());
     if (cfg.dataDir) writeManifest(cfg.dataDir, manifest);
-    await cfg.adapter.postAspRoot(localRoot, computeDatasetHash(manifest.labels));
+    await cfg.adapter.postAspRoot(localRoot, computeDatasetHash(localRoot, manifest.labels));
     published = true;
     if (cfg.publicationMonitor) {
       cfg.publicationMonitor.recordPublication(localRoot, state.lastLedger);
@@ -153,18 +165,27 @@ export async function runPoolTick(cfg: TickConfig): Promise<TickResult> {
     cfg.adapter.currentStateRoot &&
     cfg.adapter.postStateRoot
   ) {
-    const snapshot = await cfg.adapter.readStateLeaves();
-    stateLeafCount = snapshot.leaves.length;
-    if (snapshot.eventCount > 0) {
+    const snapshot = await cfg.adapter.readStateLeaves(state.stateEventCursor ?? 0);
+    const accumulated = state.stateLeaves ?? [];
+    if (snapshot.events) {
+      for (const event of snapshot.events) accumulated[event.index] = event.leaf;
+      state.stateLeaves = accumulated;
+    } else if ((state.stateEventCursor ?? 0) === 0) {
+      state.stateLeaves = [...snapshot.leaves];
+    }
+    if (snapshot.cursor !== undefined) state.stateEventCursor = snapshot.cursor;
+    const leaves = state.stateLeaves ?? snapshot.leaves;
+    stateLeafCount = leaves.length;
+    if (snapshot.eventCount > 0 || leaves.length > 0) {
       const poseidon = await getPoseidon();
       const tree = new MerkleTree(poseidon);
-      for (const leaf of snapshot.leaves) {
+      for (const leaf of leaves) {
         tree.insert(BigInt(leaf));
       }
       stateRoot = toHex32(tree.root());
       onChainStateRoot = await cfg.adapter.currentStateRoot();
       if (stateRoot !== onChainStateRoot) {
-        await cfg.adapter.postStateRoot(stateRoot, computeDatasetHash(snapshot.leaves));
+        await cfg.adapter.postStateRoot(stateRoot, computeDatasetHash(stateRoot, leaves));
         statePublished = true;
       }
     }

@@ -10,12 +10,21 @@ import type { SetManifest } from "./types.ts";
 
 /**
  * Deterministic 32-byte dataset hash binding a published root to its exact leaf set.
- * Stored on-chain alongside the root (the contract treats it as opaque). sha256 over the
- * ordered label list keeps it reproducible by any verifier.
+ * Stored on-chain alongside the root (the contract treats it as opaque). SHA256 covers
+ * BE32(count), the canonical root bytes, and canonical 32-byte leaf values.
  */
-export function computeDatasetHash(labels: string[]): string {
+export function computeDatasetHash(root: string, labels: string[]): string {
   const h = createHash("sha256");
-  for (const l of labels) h.update(l).update("\n");
+  const count = Buffer.alloc(4);
+  count.writeUInt32BE(labels.length >>> 0, 0);
+  h.update(count);
+  h.update(Buffer.from(root.replace(/^0x/, ""), "hex"));
+  for (const label of labels) {
+    let value = BigInt(label);
+    const bytes = Buffer.alloc(32);
+    for (let i = 31; i >= 0; i--) { bytes[i] = Number(value & 255n); value >>= 8n; }
+    h.update(bytes);
+  }
   return "0x" + h.digest("hex");
 }
 

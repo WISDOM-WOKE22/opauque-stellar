@@ -98,8 +98,10 @@ describe("store", () => {
 
 describe("dataset hash", () => {
   it("is deterministic and order-sensitive", () => {
-    expect(computeDatasetHash(["1", "2"])).toBe(computeDatasetHash(["1", "2"]));
-    expect(computeDatasetHash(["1", "2"])).not.toBe(computeDatasetHash(["2", "1"]));
+    const root = `0x${"11".repeat(32)}`;
+    expect(computeDatasetHash(root, ["1", "2"])).toBe(computeDatasetHash(root, ["1", "2"]));
+    expect(computeDatasetHash(root, ["1", "2"])).not.toBe(computeDatasetHash(root, ["2", "1"]));
+    expect(computeDatasetHash(root, ["1", "2"])).toBe("0xe22e40d771557c5cda2b8d65d1858102658145607aacdd5600a1d4dd54b78896");
   });
 });
 
@@ -197,6 +199,9 @@ describe("engine reconcile", () => {
     expect(store.load("pool")?.approvedIndices).toEqual([1]);
     expect(store.load("pool")?.rejectedIndices).toEqual([0, 2]);
     expect(adapter.posts).toHaveLength(1);
+    expect(store.load("pool")?.decisions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ depositIndex: 0, policy: "allowlist", verdict: "reject", reason: expect.stringMatching(/allowlist|absent/i) }),
+    ]));
   });  it("self-heals when the on-chain root drifts (crash-after-compute)", async () => {
     const adapter = new FakeAdapter();
     const store = new MemoryStore();
@@ -267,6 +272,12 @@ describe("policy engine", () => {
       strategy: "any-approve",
     });
     expect(await engine.screen(dep(0))).toBe("approve"); // approveAll approves
+  });
+
+  it("keeps defer as defer when no policy has a terminal answer", async () => {
+    const defer = { name: "pending", screen: () => "defer" as const, reason: () => "needs more evidence" };
+    expect(await new PolicyEngine({ policies: [defer], strategy: "any-approve" }).screen(dep(0))).toBe("defer");
+    expect(await new PolicyEngine({ policies: [defer], strategy: "all-must-approve" }).screen(dep(0))).toBe("defer");
   });
 
   it("all-must-approve requires every policy to approve", async () => {
