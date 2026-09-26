@@ -7,7 +7,7 @@
  * Usage: npx tsx scripts/verify-merkle-root.ts --network testnet --root 0x... [--dataset-hash 0x...]
  */
 
-import { SorobanRpc } from "@stellar/stellar-sdk";
+import { Server } from "@stellar/stellar-sdk";
 import * as fs from "fs";
 
 const USAGE = `
@@ -33,7 +33,7 @@ interface RootEntry {
 
 async function getRpcUrl(network: string): Promise<string> {
   const networks: { [key: string]: string } = {
-    testnet: "https://soroban-testnet.stellar.org",
+    testnet: "https://rpc-futurenet.stellar.org",
     mainnet: "https://soroban-mainnet.stellar.org",
   };
   return networks[network] || networks.testnet;
@@ -43,24 +43,25 @@ async function fetchRootEntries(
   contractId: string,
   rpcUrl: string,
 ): Promise<RootEntry[]> {
-  const server = new SorobanRpc.Server(rpcUrl);
+  const server = new Server(rpcUrl);
   const entries: RootEntry[] = [];
 
   try {
-    const result = (await (server as any).getContractData(
-      contractId,
-      "root_history",
-    )) as any;
+    const ledgerEntries = await server.getLedgerEntries(contractId);
+    if (!ledgerEntries || !ledgerEntries.records) return entries;
 
-    if (!result) return entries;
+    for (const record of ledgerEntries.records) {
+      const data = record.val as any;
+      if (!data) continue;
 
-    const roots = result.val?.vec || [];
-    for (const rootVal of roots) {
-      const rootHex = rootVal.buf.toString("hex");
-      entries.push({ root: `0x${rootHex}`, ledger: 0, dataset_hash: "" });
+      const root = data.root || "";
+      const ledger = data.ledger || 0;
+      const datasetHash = data.dataset_hash || "";
+
+      entries.push({ root, ledger, dataset_hash: datasetHash });
     }
   } catch (err) {
-    console.error("Failed to fetch root history:", err);
+    console.error("Failed to fetch root entries:", err);
   }
 
   return entries;
@@ -90,13 +91,17 @@ async function main() {
     : null;
   const verifyAll = args.includes("--all");
 
-  const deployments = JSON.parse(
-    fs.readFileSync("deployments/v1/testnet.json", "utf-8"),
-  );
-  const contractId =
+  let contractId =
     args.includes("--contract") &&
     args[args.indexOf("--contract") + 1];
-  contractId || deployments.reputation_verifier;
+
+  if (!contractId) {
+    const deploymentFile = `deployments/v1/${network}.json`;
+    if (fs.existsSync(deploymentFile)) {
+      const deployments = JSON.parse(fs.readFileSync(deploymentFile, "utf-8"));
+      contractId = deployments.reputation_verifier;
+    }
+  }
 
   if (!contractId) {
     console.error("Error: No contract ID found. Specify with --contract.");

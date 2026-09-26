@@ -78,6 +78,11 @@ type IdempotencyEntry = {
 
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** Expiry time for old bids (90 days). */
+const BID_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000;
+
+type BidEntry = RelayerBid & { addedAt: number };
+
 export class RelayerEngine {
   readonly stats: RelayerEngineStats = {
     jobsSeen: 0,
@@ -89,10 +94,11 @@ export class RelayerEngine {
     lastError: null,
   };
 
-  private bids = new Map<string, RelayerBid[]>();
+  private bids = new Map<string, BidEntry[]>();
   private idempotencyStore = new Map<string, IdempotencyEntry>();
   private pendingIdempotency = new Map<string, Promise<{ acceptedTx: string; submittedTx: string } | null>>();
   private pendingJobs = new Map<string, number>();
+  private pruneTimer: ReturnType<typeof setInterval> | null = null;
   private startedAt: number;
 
   constructor(private cfg: RelayerEngineConfig) {
@@ -176,7 +182,7 @@ export class RelayerEngine {
     const key = bid.jobId.toLowerCase();
     const list = this.bids.get(key) ?? [];
     if (!list.some((b) => b.operator === bid.operator)) {
-      list.push(bid);
+      list.push({ ...bid, addedAt: Date.now() });
       this.bids.set(key, list);
     }
   }
@@ -251,6 +257,36 @@ export class RelayerEngine {
     }
 
     return processPayload();
+  }
+
+  /** Prune expired entries from memory maps. Runs on a timer. Safe to call multiple times. */
+  startPruneWatch(intervalMs: number = 60 * 60 * 1000): void {
+    if (this.pruneTimer !== null) return;
+    this.pruneTimer = setInterval(() => this.prune(), intervalMs);
+  }
+
+  stopPruneWatch(): void {
+    if (this.pruneTimer !== null) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+    }
+  }
+
+  private prune(now: number = Date.now()): void {
+    for (const [jobId, bidList] of this.bids) {
+      const fresh = bidList.filter((bid) => now - bid.addedAt < BID_EXPIRY_MS);
+      if (fresh.length === 0) {
+        this.bids.delete(jobId);
+      } else if (fresh.length !== bidList.length) {
+        this.bids.set(jobId, fresh);
+      }
+    }
+
+    for (const [key, entry] of this.idempotencyStore) {
+      if (now >= entry.expiresAt) {
+        this.idempotencyStore.delete(key);
+      }
+    }
   }
 }
 

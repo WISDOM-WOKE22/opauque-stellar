@@ -14,6 +14,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Server, xdr } from "@stellar/stellar-sdk";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..");
@@ -66,14 +67,10 @@ function loadDeployment(network: string): Record<string, string> {
 
 async function checkTtl(
   rpcUrl: string,
-  passphrase: string,
   contractId: string,
   contractName: string,
   threshold: number,
 ): Promise<TtlReport> {
-  // soroban-cli is used for raw contract storage inspection.
-  // This is a simplified check — in production, use the Stellar SDK's
-  // getContractData or getLedgerEntries RPC methods.
   const report: TtlReport = {
     contractId,
     contractName,
@@ -83,34 +80,40 @@ async function checkTtl(
   };
 
   try {
-    // Use soroban-cli to read contract storage entries.
-    // For a full implementation, use the Stellar SDK to iterate storage entries.
-    const { execSync } = await import("node:child_process");
+    const server = new Server(rpcUrl);
 
-    // Read the current ledger to compute live-until.
-    const ledgerResult = execSync(
-      `soroban contract read --id ${contractId} --network-url ${rpcUrl} --network-passphrase "${passphrase}" 2>/dev/null || echo "[]"`,
-      { encoding: "utf-8", timeout: 30_000 },
-    );
+    const ledgerResponse = await server.ledgers().limit(1).order("desc").call();
+    const currentLedger = parseInt(ledgerResponse.records[0].sequence);
 
-    // Parse output — each line is a key-value pair from persistent storage.
-    const lines = ledgerResult.trim().split("\n").filter(Boolean);
-    report.totalCount = lines.length;
+    const contractEntries = await server
+      .contractData()
+      .forContract(contractId)
+      .call();
 
-    for (const line of lines) {
+    if (!contractEntries.records) {
+      return report;
+    }
+
+    report.totalCount = contractEntries.records.length;
+
+    for (const record of contractEntries.records) {
+      const ledgerEntry = record as any;
+      const ttl = ledgerEntry.live_until_ledger_seq || DEFAULT_PERSISTENT_TTL;
+      const liveUntilLedger = ttl;
+      const remainingLedgers = Math.max(0, ttl - currentLedger);
+
       const entry: ContractEntry = {
-        key: line.substring(0, 64),
-        ttl: DEFAULT_PERSISTENT_TTL,
-        liveUntilLedger: 0,
+        key: ledgerEntry.key?.substring(0, 64) || "",
+        ttl: remainingLedgers,
+        liveUntilLedger,
       };
 
-      if (entry.ttl < threshold) {
+      if (remainingLedgers < threshold) {
         report.expiringCount++;
       }
       report.entries.push(entry);
     }
   } catch (err) {
-    // Contract may not be deployed or RPC may be unreachable.
     console.warn(`  Warning: could not read storage for ${contractName}: ${(err as Error).message}`);
   }
 
@@ -149,7 +152,7 @@ async function main() {
     if (!contractId) continue;
     if (contractFilter && contractId !== contractFilter && name !== contractFilter) continue;
 
-    const report = await checkTtl(rpcUrl, passphrase, contractId, name, threshold);
+    const report = await checkTtl(rpcUrl, contractId, name, threshold);
     const status = report.expiringCount > 0 ? "⚠️  EXPIRING" : "✅ OK";
     console.log(`${status}  ${name} (${contractId.slice(0, 8)}...)`);
     console.log(`  Entries: ${report.totalCount}, Expiring: ${report.expiringCount}`);

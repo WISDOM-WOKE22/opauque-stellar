@@ -1,8 +1,8 @@
 /**
- * NaCl `crypto_box` sealing for relayer payloads. `tweetnacl` is an optional peer
- * dependency, loaded lazily so consumers that never touch the relayer market do
- * not need it installed.
+ * NaCl `crypto_box` sealing for relayer payloads. Shared between the relayer node
+ * and the SDK to ensure identical encryption/decryption.
  */
+import nacl from "tweetnacl";
 import { assertLength, base64ToBytes, bytesToBase64, concatBytes } from "./bytes";
 
 const PUBLIC_KEY_BYTES = 32;
@@ -15,35 +15,12 @@ function randomBytes(len: number): Uint8Array {
   return out;
 }
 
-type KeyPair = { publicKey: Uint8Array; secretKey: Uint8Array };
-interface NaclBox {
-  (msg: Uint8Array, nonce: Uint8Array, theirPk: Uint8Array, mySk: Uint8Array): Uint8Array;
-  open(box: Uint8Array, nonce: Uint8Array, theirPk: Uint8Array, mySk: Uint8Array): Uint8Array | null;
-  keyPair: { (): KeyPair; fromSecretKey(sk: Uint8Array): KeyPair };
-  overheadLength: number;
-}
-interface Nacl {
-  box: NaclBox;
-}
-
-async function getNacl(): Promise<Nacl> {
-  try {
-    return ((await import("tweetnacl")) as unknown as { default: Nacl }).default;
-  } catch (cause) {
-    throw new Error(
-      "tweetnacl is required for relayer payload encryption; install it as a peer dependency.",
-      { cause },
-    );
-  }
-}
-
 export type X25519Keypair = {
   publicKey: Uint8Array;
   secretKey: Uint8Array;
 };
 
-export async function generateX25519Keypair(seed?: Uint8Array): Promise<X25519Keypair> {
-  const nacl = await getNacl();
+export function generateX25519Keypair(seed?: Uint8Array): X25519Keypair {
   if (seed) {
     const secretKey = assertLength(seed, SECRET_KEY_BYTES, "x25519 seed");
     const pair = nacl.box.keyPair.fromSecretKey(secretKey);
@@ -53,11 +30,7 @@ export async function generateX25519Keypair(seed?: Uint8Array): Promise<X25519Ke
   return { publicKey: pair.publicKey, secretKey: pair.secretKey };
 }
 
-export async function sealBox(
-  plaintext: Uint8Array,
-  recipientPublicKey: Uint8Array,
-): Promise<string> {
-  const nacl = await getNacl();
+export function sealBox(plaintext: Uint8Array, recipientPublicKey: Uint8Array): string {
   const to = assertLength(recipientPublicKey, PUBLIC_KEY_BYTES, "recipient x25519 public key");
   const eph = nacl.box.keyPair();
   const nonce = randomBytes(NONCE_BYTES);
@@ -65,8 +38,7 @@ export async function sealBox(
   return bytesToBase64(concatBytes(eph.publicKey, nonce, ciphertext));
 }
 
-export async function openBox(box: string, recipientSecretKey: Uint8Array): Promise<Uint8Array> {
-  const nacl = await getNacl();
+export function openBox(box: string, recipientSecretKey: Uint8Array): Uint8Array {
   const secret = assertLength(recipientSecretKey, SECRET_KEY_BYTES, "recipient x25519 secret key");
   const raw = base64ToBytes(box);
   if (raw.length < PUBLIC_KEY_BYTES + NONCE_BYTES + nacl.box.overheadLength) {

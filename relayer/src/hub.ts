@@ -41,7 +41,14 @@ export const NEUTRAL_RELAYER_SCORE = 0.5;
 /** How far back completed/failed jobs count toward a relayer's score. */
 const SCORE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
+/** Expiry time for old bids (90 days). */
+const BID_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000;
+
+/** Expiry time for old assignments (7 days). */
+const ASSIGNMENT_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
+
 type OutcomeEntry = { result: "completed" | "failed"; at: number };
+type BidEntry = RelayerBid & { addedAt: number };
 
 export type RelayerScore = {
   operator: string;
@@ -62,14 +69,15 @@ export class RelayerHub {
     lastError: null,
   };
 
-  private bids = new Map<string, RelayerBid[]>();
+  private bids = new Map<string, BidEntry[]>();
   private subscribers = new Set<(message: RelayerMessage) => Promise<void> | void>();
   private outcomes = new Map<string, OutcomeEntry[]>();
   private knownOperators = new Set<string>();
   private lastHeartbeatAt = new Map<string, number>();
   /** jobId -> operator currently expected to submit it (from the last payload delivery seen). */
-  private assignments = new Map<string, string>();
+  private assignments = new Map<string, { operator: string; addedAt: number }>();
   private failoverTimer: ReturnType<typeof setInterval> | null = null;
+  private pruneTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
   private startedAt: number;
 
@@ -102,7 +110,9 @@ export class RelayerHub {
           await this.persistState();
         } else if (valid.t === "outcome") {
           this.recordOutcome(valid.operator, valid.result);
-          this.assignments.delete(valid.jobId.toLowerCase());
+          const jobKey = valid.jobId.toLowerCase();
+          this.assignments.delete(jobKey);
+          this.bids.delete(jobKey);
           this.stats.outcomesSeen += 1;
           await this.persistState();
         } else if (valid.t === "heartbeat") {
@@ -157,7 +167,7 @@ export class RelayerHub {
     const key = bid.jobId.toLowerCase();
     const list = this.bids.get(key) ?? [];
     if (!list.some((b) => b.operator === bid.operator)) {
-      list.push(bid);
+      list.push({ ...bid, addedAt: Date.now() });
       this.bids.set(key, list);
     }
     this.knownOperators.add(bid.operator);
@@ -177,7 +187,7 @@ export class RelayerHub {
   private rememberAssignment(payload: EncryptedPayload): void {
     const key = payload.jobId.toLowerCase();
     const bid = this.bidsFor(key).find((b) => b.x25519Pk.toLowerCase() === payload.to.toLowerCase());
-    if (bid) this.assignments.set(key, bid.operator);
+    if (bid) this.assignments.set(key, { operator: bid.operator, addedAt: Date.now() });
   }
 
   recordHeartbeat(operator: string, at: number = Date.now()): void {
@@ -202,15 +212,15 @@ export class RelayerHub {
    */
   runFailoverCheck(now: number = Date.now()): FailoverEvent[] {
     const events: FailoverEvent[] = [];
-    for (const [jobId, operator] of this.assignments) {
-      if (this.isNodeAlive(operator, now)) continue;
+    for (const [jobId, assignment] of this.assignments) {
+      if (this.isNodeAlive(assignment.operator, now)) continue;
       const alt = this.bidsFor(jobId).find(
-        (bid) => bid.operator !== operator && this.isNodeAlive(bid.operator, now),
+        (bid) => bid.operator !== assignment.operator && this.isNodeAlive(bid.operator, now),
       );
       if (!alt) continue;
-      this.assignments.set(jobId, alt.operator);
+      this.assignments.set(jobId, { operator: alt.operator, addedAt: now });
       this.onFailover(jobId);
-      events.push({ jobId, from: operator, to: alt.operator });
+      events.push({ jobId, from: assignment.operator, to: alt.operator });
     }
     return events;
   }
@@ -226,6 +236,48 @@ export class RelayerHub {
       clearInterval(this.failoverTimer);
       this.failoverTimer = null;
     }
+  }
+
+  /** Prune expired entries from memory maps. Runs on a timer. Safe to call multiple times. */
+  startPruneWatch(intervalMs: number = 60 * 60 * 1000): void {
+    if (this.pruneTimer !== null) return;
+    this.pruneTimer = setInterval(() => this.prune(), intervalMs);
+  }
+
+  stopPruneWatch(): void {
+    if (this.pruneTimer !== null) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+    }
+  }
+
+  private prune(now: number = Date.now()): void {
+    for (const [jobId, bidList] of this.bids) {
+      const fresh = bidList.filter((bid) => now - bid.addedAt < BID_EXPIRY_MS);
+      if (fresh.length === 0) {
+        this.bids.delete(jobId);
+      } else if (fresh.length !== bidList.length) {
+        this.bids.set(jobId, fresh);
+      }
+    }
+
+    for (const [jobId, assignment] of this.assignments) {
+      if (now - assignment.addedAt >= ASSIGNMENT_EXPIRY_MS) {
+        this.assignments.delete(jobId);
+      }
+    }
+
+    const cutoff = now - SCORE_WINDOW_MS;
+    for (const [operator, outcomeList] of this.outcomes) {
+      const fresh = outcomeList.filter((entry) => entry.at >= cutoff);
+      if (fresh.length === 0) {
+        this.outcomes.delete(operator);
+      } else if (fresh.length !== outcomeList.length) {
+        this.outcomes.set(operator, fresh);
+      }
+    }
+
+    void this.persistState();
   }
 
   private windowedOutcomes(operator: string, now = Date.now()): OutcomeEntry[] {
@@ -278,17 +330,18 @@ export class RelayerHub {
   private async persistState(): Promise<void> {
     if (!this.store) return;
     try {
+      const bidsForStore = Array.from(this.bids.entries()).map(([k, v]) => [k, v.map(b => ({ ...b }))]);
+      const assignmentsForStore = Array.from(this.assignments.entries()).map(([k, v]) => [k, v]);
       await this.store.save({
-        bids: Array.from(this.bids.entries()),
+        bids: bidsForStore,
         outcomes: Array.from(this.outcomes.entries()),
         knownOperators: Array.from(this.knownOperators),
         lastHeartbeatAt: Array.from(this.lastHeartbeatAt.entries()),
-        assignments: Array.from(this.assignments.entries()),
+        assignments: assignmentsForStore,
         stats: { ...this.stats },
       });
     } catch (err) {
       this.stats.lastError = err instanceof Error ? err.message : String(err);
-      log.error("hub persist failed", { error: err });
     }
   }
 
@@ -301,7 +354,9 @@ export class RelayerHub {
       for (const [k, v] of saved.outcomes) this.outcomes.set(k, v);
       for (const op of saved.knownOperators) this.knownOperators.add(op);
       for (const [k, v] of saved.lastHeartbeatAt) this.lastHeartbeatAt.set(k, v);
-      for (const [k, v] of saved.assignments) this.assignments.set(k, v);
+      for (const [k, v] of saved.assignments) {
+        this.assignments.set(k, typeof v === "string" ? { operator: v, addedAt: Date.now() } : v);
+      }
       if (saved.stats) {
         this.stats.advertsSeen = saved.stats.advertsSeen;
         this.stats.bidsSeen = saved.stats.bidsSeen;
@@ -309,10 +364,8 @@ export class RelayerHub {
         this.stats.outcomesSeen = saved.stats.outcomesSeen;
         this.stats.heartbeatsSeen = saved.stats.heartbeatsSeen;
       }
-      log.info("restored state from store", { bids: this.bids.size, operators: this.knownOperators.size, assignments: this.assignments.size });
     } catch (err) {
       this.stats.lastError = err instanceof Error ? err.message : String(err);
-      log.error("hub hydrate failed", { error: err });
     }
   }
 }

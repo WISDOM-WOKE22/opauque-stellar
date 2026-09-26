@@ -75,3 +75,12 @@ export function i128ToBytes(value: bigint): Uint8Array {
   }
   return out;
 }
+
+export function u32ToBytes(value: number): Uint8Array {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+    throw new Error("u32 out of range.");
+  }
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, value, false);
+  return out;
+}
