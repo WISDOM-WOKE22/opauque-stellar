@@ -55,6 +55,7 @@ const registryId =
 const rpcUrl = process.env.STELLAR_RPC_URL?.trim() || manifest.rpcUrl;
 const endpoint = process.env.RELAYER_ENDPOINT?.trim() || "http://127.0.0.1:8787";
 const minFee = BigInt(process.env.RELAYER_MIN_FEE ?? "100000");
+const deadlineMarginLedgers = numberEnv("RELAYER_DEADLINE_MARGIN_LEDGERS", 30, { min: 0, integer: true });
 const endpointPort = new URL(endpoint).port;
 const port = numberEnv("RELAYER_PORT", Number(endpointPort || 8787), { min: 1, max: 65535, integer: true });
 
@@ -71,6 +72,7 @@ const engine = new RelayerEngine({
   endpoint,
   minFee,
   chain,
+  deadlineMarginLedgers,
 });
 
 const hubUrl = process.env.RELAYER_HUB_URL?.trim();

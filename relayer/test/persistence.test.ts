@@ -52,6 +52,9 @@ class StubChain implements RelayerChainAdapter {
   async getRelayer(): Promise<OnChainRelayer | null> {
     return null;
   }
+  async latestLedger(): Promise<number> {
+    return 0;
+  }
   async simulatePoolWithdraw(): Promise<void> {}
   async acceptJob(): Promise<string> {
     return "acc-tx";

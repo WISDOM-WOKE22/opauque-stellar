@@ -34,6 +34,12 @@ export type OnChainRelayer = {
 export interface RelayerChainAdapter {
   getJob(jobId: string): Promise<OnChainJob | null>;
   getRelayer(operator: string): Promise<OnChainRelayer | null>;
+  /**
+   * Latest finalized ledger. The engine needs this to measure how much deadline
+   * is left before bidding (#974) — a job's `deadline` is a ledger number, not a
+   * wall-clock time, so it can only be compared against the chain's current head.
+   */
+  latestLedger(): Promise<number>;
   simulatePoolWithdraw(payload: PoolWithdrawPayload): Promise<void>;
   acceptJob(jobId: string): Promise<string>;
   submitPoolWithdraw(jobId: string, payload: PoolWithdrawPayload): Promise<string>;
@@ -48,6 +54,14 @@ export interface RelayerEngineConfig {
   chain: RelayerChainAdapter;
   /** Optional ledger that records each successfully submitted job for reconciliation. */
   jobLedger?: JobLedger;
+  /**
+   * Ledgers of deadline headroom a job must still have before the engine bids on
+   * it (#974). Accepting a job commits this operator to two sequential on-chain
+   * transactions — `accept_job`, then `submit_pool_withdraw` — so a job that is
+   * about to expire cannot realistically be completed and would end in a slash
+   * for a deadline the operator never had time to meet.
+   */
+  deadlineMarginLedgers?: number;
 }
 
 export type RelayerEngineStats = {
@@ -57,6 +71,8 @@ export type RelayerEngineStats = {
   accepted: number;
   submitted: number;
   rejected: number;
+  /** Adverts declined because the job had less deadline headroom than the margin (#974). */
+  deadlineDeclined: number;
   lastError: string | null;
 };
 
@@ -81,6 +97,15 @@ const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 /** Expiry time for old bids (90 days). */
 const BID_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000;
 
+/**
+ * Default deadline headroom required before bidding (#974). `accept_job` and
+ * `submit_pool_withdraw` are sequential, each confirmed against the RPC before
+ * the next is sent, and Stellar closes a ledger roughly every 5s — so 30 ledgers
+ * (~2.5 min) covers accept-plus-submit latency with room to spare. Operators on
+ * faster or slower networks can widen or narrow it.
+ */
+const DEFAULT_DEADLINE_MARGIN_LEDGERS = 30;
+
 type BidEntry = RelayerBid & { addedAt: number };
 
 export class RelayerEngine {
@@ -91,6 +116,7 @@ export class RelayerEngine {
     accepted: 0,
     submitted: 0,
     rejected: 0,
+    deadlineDeclined: 0,
     lastError: null,
   };
 
@@ -100,9 +126,12 @@ export class RelayerEngine {
   private pendingJobs = new Map<string, number>();
   private pruneTimer: ReturnType<typeof setInterval> | null = null;
   private startedAt: number;
+  private readonly deadlineMarginLedgers: number;
 
   constructor(private cfg: RelayerEngineConfig) {
     this.startedAt = Date.now();
+    const margin = cfg.deadlineMarginLedgers ?? DEFAULT_DEADLINE_MARGIN_LEDGERS;
+    this.deadlineMarginLedgers = Number.isFinite(margin) && margin >= 0 ? margin : DEFAULT_DEADLINE_MARGIN_LEDGERS;
   }
 
   bidsFor(jobId: string): RelayerBid[] {
@@ -154,6 +183,14 @@ export class RelayerEngine {
       const job = await this.cfg.chain.getJob(advert.jobId);
       if (!job?.exists || job.status !== "open") return null;
       if (job.fee < this.cfg.minFee || relayer.freeStake < job.fee) return null;
+      // #974: a deadline is a ledger number, so compare it against the chain head
+      // rather than wall-clock time. Bids on a job that is about to expire get
+      // accepted and then slashed for a deadline there was no time to meet.
+      const latestLedger = await this.cfg.chain.latestLedger();
+      if (job.deadline - latestLedger < this.deadlineMarginLedgers) {
+        this.stats.deadlineDeclined += 1;
+        return null;
+      }
       if (
         job.fee.toString() !== advert.fee ||
         job.deadline !== advert.deadline ||

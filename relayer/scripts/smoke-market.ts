@@ -134,6 +134,10 @@ async function main() {
     endpoint,
     minFee: 1n,
     chain,
+    // This script creates its job with `latestLedger() + 20` of runway, so it
+    // opts into a margin that fits that deliberately short deadline instead of
+    // the production default (#974).
+    deadlineMarginLedgers: 5,
   });
   const advert = makeAdvert({ jobId, fee, deadline, payloadHash });
   console.log("• Asking engine to bid…");
