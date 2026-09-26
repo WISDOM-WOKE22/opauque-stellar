@@ -67,11 +67,14 @@ function mergeLeaves(existing: LeafCommitment[], incoming: LeafCommitment[]): {
     byLeaf.add(leaf.leaf);
     acceptedIds.push(leaf.id);
   }
-  const leaves = Array.from(byId.values()).sort((a, b) => {
-    const aKey = `${String(a.ledger ?? 0).padStart(12, "0")}:${a.id}`;
-    const bKey = `${String(b.ledger ?? 0).padStart(12, "0")}:${b.id}`;
-    return aKey.localeCompare(bKey);
-  });
+  // Append-only ordering: existing leaves keep their positions; new leaves
+  // are appended in submission order so prior inclusion paths remain valid.
+  const leaves = [...existing];
+  for (const leaf of incoming) {
+    if (acceptedIds.includes(leaf.id)) {
+      leaves.push(leaf);
+    }
+  }
   return { leaves, acceptedIds, duplicateResubmissions, identityCollisions };
 }
 
@@ -115,8 +118,8 @@ export async function runPublisherTick(cfg: PublisherTickConfig, metrics?: Publi
 
   const minLeaves = cfg.minLeavesToPublish ?? 1;
   if (leaves.length < minLeaves) {
-    cfg.store.archiveInbox(processedIds);
     cfg.store.save(state);
+    cfg.store.archiveInbox(processedIds);
     const latencyMs = Date.now() - tickStart;
     return {
       verifierId: cfg.verifierId,
@@ -162,8 +165,8 @@ export async function runPublisherTick(cfg: PublisherTickConfig, metrics?: Publi
     }
   }
 
-  cfg.store.archiveInbox(processedIds);
   cfg.store.save(state);
+  cfg.store.archiveInbox(processedIds);
   const latencyMs = Date.now() - tickStart;
   if (metrics) {
     metrics.lastPublishLatencyMs = latencyMs;

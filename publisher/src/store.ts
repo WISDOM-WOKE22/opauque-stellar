@@ -23,13 +23,8 @@ export function normalizeCommitment(raw: unknown, now: () => string): LeafCommit
   if (!result.ok) {
     throw new Error(`invalid commitment: ${result.errors.join("; ")}`);
   }
-  if (typeof raw === "object" && raw !== null) {
-    const obj = raw as Record<string, unknown>;
-    if (typeof obj.submittedAt === "string") {
-      result.commitment.submittedAt = obj.submittedAt;
-    }
-  }
-  result.commitment.submittedAt = result.commitment.submittedAt || now();
+  // Server-assigned timestamp — never trust client-supplied submittedAt (#967)
+  result.commitment.submittedAt = now();
   return result.commitment;
 }
 
@@ -105,7 +100,10 @@ export class FileStore implements Store {
       return false;
     }
     const safeId = commitment.id.replace(/[^a-z0-9_.-]/gi, "_");
-    const p = join(this.inboxDir(), `${safeId}.json`);
+    // Use timestamp prefix to prevent filename collisions for distinct ids
+    // that sanitize to the same value (#965).
+    const ts = Date.now().toString(36);
+    const p = join(this.inboxDir(), `${ts}_${safeId}.json`);
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, `${JSON.stringify(commitment, null, 2)}\n`);
     return true;
