@@ -4,10 +4,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keypair } from "@stellar/stellar-sdk";
 import { createRelayerHttpServer } from "../src/http.ts";
-import { RelayerEngine } from "../src/engine.ts";
 import { HttpGossipTransport, MemoryGossipTransport } from "../src/gossip.ts";
-import { RelayerHub, attachRelayerEngineToGossip } from "../src/hub.ts";
+import { RelayerHub } from "../src/hub.ts";
 import { StellarRelayerChain } from "../src/chains/stellar.ts";
+import { FileAcceptedJobStore, FileLedgerStore } from "../src/store.ts";
+import { DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_RECONCILE_INTERVAL_MS, startRelayerNode } from "../src/runtime.ts";
 import { generateX25519Keypair } from "../src/shared/box.ts";
 import { bytesToHex, hexToBytes } from "../src/shared/bytes.ts";
 import { numberEnv } from "../src/env.ts";
@@ -55,6 +56,7 @@ const registryId =
 const rpcUrl = process.env.STELLAR_RPC_URL?.trim() || manifest.rpcUrl;
 const endpoint = process.env.RELAYER_ENDPOINT?.trim() || "http://127.0.0.1:8787";
 const minFee = BigInt(process.env.RELAYER_MIN_FEE ?? "100000");
+const deadlineMarginLedgers = numberEnv("RELAYER_DEADLINE_MARGIN_LEDGERS", 30, { min: 0, integer: true });
 const endpointPort = new URL(endpoint).port;
 const port = numberEnv("RELAYER_PORT", Number(endpointPort || 8787), { min: 1, max: 65535, integer: true });
 
@@ -64,28 +66,49 @@ const chain = new StellarRelayerChain({
   registryId,
   operator,
 });
-const engine = new RelayerEngine({
+
+const reconcileIntervalMs = numberEnv("RELAYER_RECONCILE_INTERVAL_MS", DEFAULT_RECONCILE_INTERVAL_MS, { min: 0 });
+const heartbeatIntervalMs = numberEnv("RELAYER_HEARTBEAT_INTERVAL_MS", DEFAULT_HEARTBEAT_INTERVAL_MS, { min: 0 });
+const dataDir = process.env.RELAYER_DATA_DIR?.trim() || join(ROOT, ".opaque-relayer");
+
+const hubUrl = process.env.RELAYER_HUB_URL?.trim();
+
+// A self-hosted hub is the single-process topology; otherwise this node is a
+// pure relayer and the hub runs elsewhere. Either way the engine is wired to its
+// ledger + reconciler and gossips heartbeats/outcomes to the hub (#973).
+const selfHosted = !hubUrl;
+const transport = hubUrl ? new HttpGossipTransport(hubUrl) : new MemoryGossipTransport();
+const hub = selfHosted ? new RelayerHub(transport) : null;
+if (hub) await hub.start();
+
+const node = await startRelayerNode({
   operator,
   x25519PublicKey: x25519.publicKey,
   x25519SecretKey: x25519.secretKey,
   endpoint,
   minFee,
   chain,
+  transport,
+  // Accepted jobs are persisted so a restart can reconcile them against the chain
+  // instead of starting blind, and accepted-but-unsubmitted jobs are persisted so
+  // a restart can finish them instead of slashing the bond (#975).
+  ledgerStore: new FileLedgerStore(dataDir),
+  acceptedJobStore: new FileAcceptedJobStore(dataDir),
+  reconcileIntervalMs,
+  heartbeatIntervalMs,
+  deadlineMarginLedgers,
+  log,
 });
 
-const hubUrl = process.env.RELAYER_HUB_URL?.trim();
-
 if (hubUrl) {
-  const transport = new HttpGossipTransport(hubUrl);
-  await attachRelayerEngineToGossip(engine, transport);
   log.info("connected to hub", { hubUrl, operator: operator.publicKey(), x25519: bytesToHex(x25519.publicKey), registryId });
 } else {
-  const transport = new MemoryGossipTransport();
-  const hub = new RelayerHub(transport);
-  await hub.start();
-  await attachRelayerEngineToGossip(engine, transport);
-
-  const server: ReturnType<typeof createServer> = createRelayerHttpServer(hub);
+  // The gateway serves the hub, with this node's reconciler attached so
+  // /v1/reconcile stops answering "reconciler not configured". Assigned onto the
+  // instance rather than spread into a literal: a spread would copy own
+  // properties only and drop the hub's prototype methods.
+  const backend = Object.assign(hub!, { reconciler: node.reconciler });
+  const server: ReturnType<typeof createServer> = createRelayerHttpServer(backend);
   server.listen(port, () => {
     log.info("gateway listening", { endpoint, operator: operator.publicKey(), x25519: bytesToHex(x25519.publicKey), registryId });
   });

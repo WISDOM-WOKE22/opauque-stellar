@@ -20,6 +20,10 @@ class StubChain implements RelayerChainAdapter {
     return null;
   }
 
+  async latestLedger(): Promise<number> {
+    return 0;
+  }
+
   async simulatePoolWithdraw(_payload: PoolWithdrawPayload): Promise<void> {}
   async acceptJob(_jobId: string): Promise<string> { return "acc-tx"; }
   async submitPoolWithdraw(_jobId: string, _payload: PoolWithdrawPayload): Promise<string> { return "sub-tx"; }

@@ -1,24 +1,25 @@
 /**
  * ASP HTTP server: runs the reconcile loop in the background and exposes health, metrics,
- * and the current association-set manifest so an orchestrator can probe it and Prometheus
- * can scrape it — mirroring the publisher's `/health` + `/metrics` API.
+ * the current association-set manifest, historical manifests by root, and per-label
+ * inclusion paths so an orchestrator can probe it, Prometheus can scrape it, and a
+ * withdrawing client can fetch the proof material for the exact root it references —
+ * mirroring the publisher's `/health` + `/metrics` API.
  *
- *   GET /health   — tick success + root freshness (503 when stale/failing)
- *   GET /metrics  — Prometheus exposition format (tick duration, publication lag, failures)
- *   GET /manifest — current association-set manifest (data/sets/<poolId>/latest.json)
+ *   GET /health                      — tick success + root freshness (503 when stale/failing)
+ *   GET /metrics                     — Prometheus exposition format (tick duration, publication lag, failures)
+ *   GET /manifest                    — current association-set manifest (data/sets/<poolId>/latest.json)
+ *   GET /manifest/:root              — a specific historical manifest (data/sets/<poolId>/<root>.json)
+ *   GET /inclusion/:root/:label      — that label's inclusion path for a given root (#972)
  *
  * Config: same env vars as `indexer.ts` (see its header comment), plus:
  *   ASP_HTTP_HOST (default 127.0.0.1), ASP_HTTP_PORT (default 8791), ASP_CORS_ORIGIN (default *).
  */
 import { createServer } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { StellarChainAdapter } from "../src/chains/stellar.ts";
 import { FileStore } from "../src/store.ts";
 import { createAspMetrics, formatPrometheusMetrics, rootAgeMs } from "../src/metrics.ts";
+import { readInclusion, readLatestManifest, readManifestByRoot } from "../src/manifest-service.ts";
 import { createPublicationMonitor, createReorgGuard, loadConfig, tick } from "./indexer.ts";
-import { backoffDelayMs } from "../src/backoff.ts";
-import { createLogger } from "../src/logger.ts";
 import { backoffDelayMs } from "../src/backoff.ts";
 import { createLogger } from "../src/logger.ts";
 
@@ -72,7 +73,7 @@ async function main() {
   }
   loop();
 
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     try {
       if (req.method === "OPTIONS") {
         send(res, 204, {}, corsOrigin);
@@ -112,18 +113,32 @@ async function main() {
       }
 
       if (req.method === "GET" && url.pathname === "/manifest") {
-        const manifestPath = join(cfg.dataDir, "sets", cfg.poolId, "latest.json");
-        if (!existsSync(manifestPath)) {
-          send(res, 404, { ok: false, error: "no manifest published yet" }, corsOrigin);
-          return;
-        }
-        send(res, 200, JSON.parse(readFileSync(manifestPath, "utf8")), corsOrigin);
+        const result = readLatestManifest(cfg.dataDir, cfg.poolId);
+        send(res, result.status, result.body, corsOrigin);
+        return;
+      }
+
+      // #972: historical manifests by root, and the inclusion path for a single
+      // label — a withdrawing client needs the proof material for the specific
+      // root its proof references, not just whatever is current.
+      const manifestByRoot = /^\/manifest\/(0x[0-9a-fA-F]{64})$/.exec(url.pathname);
+      if (req.method === "GET" && manifestByRoot) {
+        const result = readManifestByRoot(cfg.dataDir, cfg.poolId, manifestByRoot[1]!);
+        send(res, result.status, result.body, corsOrigin);
+        return;
+      }
+
+      const inclusion = /^\/inclusion\/(0x[0-9a-fA-F]{64})\/(\d{1,78})$/.exec(url.pathname);
+      if (req.method === "GET" && inclusion) {
+        const result = await readInclusion(cfg.dataDir, cfg.poolId, inclusion[1]!, inclusion[2]!);
+        send(res, result.status, result.body, corsOrigin);
         return;
       }
 
       send(res, 404, { ok: false, error: "not found" }, corsOrigin);
     } catch (err) {
-      send(res, 500, { ok: false, error: err?.message ?? String(err) }, corsOrigin);
+      const message = err instanceof Error ? err.message : String(err);
+      send(res, 500, { ok: false, error: message }, corsOrigin);
     }
   });
 

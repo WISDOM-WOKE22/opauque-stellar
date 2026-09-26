@@ -160,6 +160,22 @@ export interface PoolWithdrawWitness {
  * build every witness up front and only parallelize the CPU-heavy `fullProve`
  * calls across a worker pool.
  */
+/**
+ * An inclusion path fetched from the ASP for a specific root (issue #972).
+ * Supplying this lets the caller skip reconstructing the association tree from
+ * every approved deposit index — it only has to supply their own label's path.
+ */
+export interface AspWitnessInclusion {
+  /** Root the path was computed against; must equal the manifest/ASP root. */
+  root: string;
+  /** The caller's own label, decimal field element. */
+  label: string;
+  /** Bottom-up sibling path — the circuit's `aspSiblings`. */
+  pathElements: string[];
+  /** Direction bits — the circuit's `aspIndex`. */
+  pathIndices: string[];
+}
+
 export async function buildPoolWithdrawWitness(opts: {
   note: PoolNote;
   recipient: string;
@@ -168,6 +184,11 @@ export async function buildPoolWithdrawWitness(opts: {
   scope: number;
   stateLeaves: bigint[];
   depositIndices: number[];
+  /**
+   * Pre-fetched ASP inclusion path for this note's label (#972). When given,
+   * `depositIndices` is only used to look the label up, not to rebuild the tree.
+   */
+  aspInclusion?: AspWitnessInclusion;
 }): Promise<PoolWithdrawWitness> {
   const { note } = opts;
   const value = BigInt(note.value);
@@ -177,21 +198,55 @@ export async function buildPoolWithdrawWitness(opts: {
   const poseidon = await getPoseidon();
   const h = (xs: bigint[]) => hashFields(poseidon, xs);
 
-  const aspLeafIndex = opts.depositIndices.indexOf(note.leafIndex);
-  if (aspLeafIndex < 0) {
-    throw new Error(`Leaf #${note.leafIndex} is not among the pool's deposits.`);
-  }
+  const label = h([BigInt(opts.scope), BigInt(note.leafIndex)]);
+  const stateTree = new PoolMerkleTree(poseidon, opts.stateLeaves);
+  const statePath = stateTree.proof(note.leafIndex);
+
   const onChain = opts.stateLeaves[note.leafIndex];
   if (onChain != null && toHex32(onChain).toLowerCase() !== note.commitment.toLowerCase()) {
     throw new Error(`Leaf #${note.leafIndex} commitment does not match this note.`);
   }
 
-  const label = h([BigInt(opts.scope), BigInt(note.leafIndex)]);
-  const aspLeaves = opts.depositIndices.map((i) => h([BigInt(opts.scope), BigInt(i)]));
-  const stateTree = new PoolMerkleTree(poseidon, opts.stateLeaves);
-  const aspTree = new PoolMerkleTree(poseidon, aspLeaves);
-  const statePath = stateTree.proof(note.leafIndex);
-  const aspPath = aspTree.proof(aspLeafIndex);
+  let aspRoot: bigint;
+  let aspSiblings: string[];
+  let aspIndex: string[];
+  if (opts.aspInclusion) {
+    // The ASP already committed to a root and a path for this label; trust neither
+    // blindly — the caller-supplied path must reproduce the root it claims, and
+    // the label must be the one this note derives.
+    const inclusion = opts.aspInclusion;
+    if (BigInt(inclusion.label) !== label) {
+      throw new Error("ASP inclusion proof is for a different label than this note.");
+    }
+    if (inclusion.pathElements.length !== inclusion.pathIndices.length) {
+      throw new Error("ASP inclusion proof is malformed: path/index length mismatch.");
+    }
+    let computed = BigInt(inclusion.label);
+    for (let level = 0; level < inclusion.pathElements.length; level += 1) {
+      const sibling = BigInt(inclusion.pathElements[level]!);
+      computed =
+        Number(inclusion.pathIndices[level]) === 1
+          ? hashFields(poseidon, [sibling, computed])
+          : hashFields(poseidon, [computed, sibling]);
+    }
+    if (computed !== BigInt(inclusion.root)) {
+      throw new Error("ASP inclusion proof does not reproduce the root it claims.");
+    }
+    aspRoot = computed;
+    aspSiblings = inclusion.pathElements;
+    aspIndex = inclusion.pathIndices;
+  } else {
+    const aspLeafIndex = opts.depositIndices.indexOf(note.leafIndex);
+    if (aspLeafIndex < 0) {
+      throw new Error(`Leaf #${note.leafIndex} is not among the pool's deposits.`);
+    }
+    const aspLeaves = opts.depositIndices.map((i) => h([BigInt(opts.scope), BigInt(i)]));
+    const aspTree = new PoolMerkleTree(poseidon, aspLeaves);
+    const aspPath = aspTree.proof(aspLeafIndex);
+    aspRoot = aspTree.root();
+    aspSiblings = aspPath.siblings.map((x) => x.toString());
+    aspIndex = aspPath.indices.map((x) => x.toString());
+  }
 
   const change = newNoteSecrets();
   const newPrecommit = h([BigInt(change.nullifier), BigInt(change.secret)]);
@@ -208,7 +263,7 @@ export async function buildPoolWithdrawWitness(opts: {
   const input: Record<string, unknown> = {
     withdrawnValue: withdrawnValue.toString(),
     stateRoot: stateTree.root().toString(),
-    aspRoot: aspTree.root().toString(),
+    aspRoot: aspRoot.toString(),
     nullifierHash: nullifierHash.toString(),
     newCommitment: newCommitment.toString(),
     context: context.toString(),
@@ -220,15 +275,15 @@ export async function buildPoolWithdrawWitness(opts: {
     newSecret: change.secret,
     stateSiblings: statePath.siblings.map((x) => x.toString()),
     stateIndex: statePath.indices.map((x) => x.toString()),
-    aspSiblings: aspPath.siblings.map((x) => x.toString()),
-    aspIndex: aspPath.indices.map((x) => x.toString()),
+    aspSiblings,
+    aspIndex,
   };
 
   return {
     input,
     withdrawnValue,
     stateRoot: stateTree.root(),
-    aspRoot: aspTree.root(),
+    aspRoot,
     nullifierHash,
     newCommitment,
   };
@@ -256,6 +311,10 @@ function finishPoolWithdrawProof(
  * `relayer`). The caller supplies the reconstructed pool leaves: `stateLeaves`
  * (commitment per state-tree index) and `depositIndices` (state index of each
  * deposit, in ASP-tree order).
+ *
+ * Alternatively, pass `aspInclusion` — a path fetched from the ASP's
+ * `GET /inclusion/:root/:label` endpoint — to prove against a published root
+ * without rebuilding the association tree locally (#972).
  */
 export async function provePoolWithdraw(opts: {
   note: PoolNote;
@@ -265,6 +324,8 @@ export async function provePoolWithdraw(opts: {
   scope: number;
   stateLeaves: bigint[];
   depositIndices: number[];
+  /** Pre-fetched ASP inclusion path for this note's label (#972). */
+  aspInclusion?: AspWitnessInclusion;
   artifacts: ArtifactResolver;
   snarkjs?: SnarkjsLike;
 }): Promise<PoolWithdrawProof> {
@@ -287,6 +348,8 @@ export interface PoolWithdrawBatchJob {
   scope?: number;
   stateLeaves: bigint[];
   depositIndices: number[];
+  /** Pre-fetched ASP inclusion path for this note's label (#972). */
+  aspInclusion?: AspWitnessInclusion;
 }
 
 /**
@@ -314,6 +377,7 @@ export async function provePoolWithdrawBatch(opts: {
         scope: job.scope ?? job.note.scope,
         stateLeaves: job.stateLeaves,
         depositIndices: job.depositIndices,
+        aspInclusion: job.aspInclusion,
       }),
     ),
   );

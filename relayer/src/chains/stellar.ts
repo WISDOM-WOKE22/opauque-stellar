@@ -114,6 +114,16 @@ export class StellarRelayerChain implements RelayerChainAdapter {
     };
   }
 
+  /**
+   * Latest finalized ledger, used to measure remaining deadline headroom before
+   * bidding (#974). Job deadlines are ledger numbers, so this is the only way to
+   * tell whether a job still has time to be accepted and submitted.
+   */
+  async latestLedger(): Promise<number> {
+    const latest = await this.server.getLatestLedger();
+    return Number(latest.sequence);
+  }
+
   async simulatePoolWithdraw(payload: PoolWithdrawPayload): Promise<void> {
     const retval = await this.simulate(payload.poolId, "withdraw", poolWithdrawArgs(payload));
     if (!retval) {

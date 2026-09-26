@@ -105,7 +105,18 @@ Optional overrides:
 STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 RELAYER_REGISTRY_ID=C...
 RELAYER_MIN_FEE=100000
+RELAYER_DEADLINE_MARGIN_LEDGERS=30
 ```
+
+`RELAYER_DEADLINE_MARGIN_LEDGERS` is how much deadline headroom a job must still
+have before the engine bids on it. Accepting a job commits the operator to two
+sequential on-chain transactions — `accept_job`, then `submit_pool_withdraw` — so
+the engine declines jobs with less runway than this rather than getting slashed
+for a deadline it had no time to meet. The default of 30 ledgers (~2.5 minutes at
+Stellar's ~5s cadence) covers accept-plus-submit latency; lower it only if your
+RPC confirms transactions faster than that, and never below the margin your own
+accept-to-submit path needs. Declined jobs are counted as
+`deadlineDeclined` in the engine's `/health` stats.
 
 ## Register
 

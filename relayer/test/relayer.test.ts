@@ -57,6 +57,7 @@ class FakeChain implements RelayerChainAdapter {
   accepted = 0;
   submitted = 0;
   simulated = 0;
+  latest = 100;
 
   constructor(payloadHash: string, x25519Pk: string) {
     this.job = {
@@ -80,6 +81,10 @@ class FakeChain implements RelayerChainAdapter {
 
   async getRelayer(): Promise<OnChainRelayer> {
     return this.relayer;
+  }
+
+  async latestLedger(): Promise<number> {
+    return this.latest;
   }
 
   async simulatePoolWithdraw(): Promise<void> {
@@ -159,6 +164,73 @@ describe("relayer market messages", () => {
       minFee: 1n,
       chain,
     });
+    await expect(engine.handleAdvert(advert)).resolves.toBeNull();
+  });
+});
+
+describe("relayer deadline awareness (#974)", () => {
+  function buildEngine(overrides: { deadline?: number; latest?: number; margin?: number } = {}) {
+    const operator = Keypair.random();
+    const x25519 = generateX25519Keypair();
+    const p = payload(operator.publicKey());
+    const advert = makeAdvert({
+      jobId: bytes(32, 0x1d),
+      fee: 100n,
+      deadline: overrides.deadline ?? 150,
+      payloadHash: hexToBytes(hashPoolWithdrawPayloadHex(p)),
+    });
+    const chain = new FakeChain(advert.payloadHash, bytesToHex(x25519.publicKey));
+    chain.latest = overrides.latest ?? 100;
+    chain.job.deadline = advert.deadline;
+    const engine = new RelayerEngine({
+      operator,
+      x25519PublicKey: x25519.publicKey,
+      x25519SecretKey: x25519.secretKey,
+      minFee: 1n,
+      chain,
+      deadlineMarginLedgers: overrides.margin ?? 30,
+    });
+    return { engine, chain, advert };
+  }
+
+  it("does not bid on a job whose remaining ledgers are below the margin", async () => {
+    // 5 ledgers left against a 30-ledger margin: accepting it would commit the
+    // operator to accept + submit with no time to spare.
+    const { engine, advert } = buildEngine({ deadline: 105, latest: 100 });
+    await expect(engine.handleAdvert(advert)).resolves.toBeNull();
+    expect(engine.stats.bidsSent).toBe(0);
+    expect(engine.stats.deadlineDeclined).toBe(1);
+  });
+
+  it("does not bid on a job that has already passed its deadline", async () => {
+    const { engine, advert } = buildEngine({ deadline: 90, latest: 100 });
+    await expect(engine.handleAdvert(advert)).resolves.toBeNull();
+    expect(engine.stats.deadlineDeclined).toBe(1);
+  });
+
+  it("bids when the remaining ledgers clear the margin", async () => {
+    const { engine, advert } = buildEngine({ deadline: 150, latest: 100 });
+    const bid = await engine.handleAdvert(advert);
+    expect(bid).not.toBeNull();
+    expect(verifyBid(bid!)).toBe(true);
+    expect(engine.stats.deadlineDeclined).toBe(0);
+  });
+
+  it("treats the margin as a hard floor — exactly the margin still bids", async () => {
+    const { engine, advert } = buildEngine({ deadline: 130, latest: 100 });
+    await expect(engine.handleAdvert(advert)).resolves.not.toBeNull();
+  });
+
+  it("honours a widened margin", async () => {
+    const { engine, advert } = buildEngine({ deadline: 150, latest: 100, margin: 500 });
+    await expect(engine.handleAdvert(advert)).resolves.toBeNull();
+  });
+
+  it("declines rather than bidding blind when the chain head is unavailable", async () => {
+    const { engine, chain, advert } = buildEngine({ deadline: 150, latest: 100 });
+    chain.latestLedger = async () => {
+      throw new Error("rpc down");
+    };
     await expect(engine.handleAdvert(advert)).resolves.toBeNull();
   });
 });

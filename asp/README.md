@@ -37,6 +37,23 @@ additionally exposes:
 | `GET`  | `/health`   | `200` when the last tick succeeded and the root is within `ASP_MAX_ROOT_AGE_MS`; `503` otherwise. |
 | `GET`  | `/metrics`  | Prometheus exposition format: tick duration, publication lag, and failure/halt/alert counters. |
 | `GET`  | `/manifest` | The current association-set manifest (`data/sets/<poolId>/latest.json`), `404` before the first publish. |
+| `GET`  | `/manifest/:root` | A specific historical manifest (`data/sets/<poolId>/<root>.json`). `404` once retention has pruned that root. |
+| `GET`  | `/inclusion/:root/:label` | That label's inclusion path for `root`: `{ root, label, index, depositIndex, levels, pathElements, pathIndices }`. `404` if the label is not in that root's set. |
+
+`:root` is a `0x`-prefixed 32-byte hex string and `:label` is a decimal BN254 field
+element; anything else is a `400`. Both are validated before being joined into a
+path, so a crafted segment cannot escape the set directory.
+
+The inclusion endpoint exists so a withdrawing client can obtain the proof
+material for the exact root its proof references instead of reconstructing the
+whole association tree from every approved deposit index. The returned path is
+re-derived from the manifest's own label list and checked against the root, so a
+proof is never served for a set it does not belong to. The SDK consumes it via
+`fetchAspInclusion()` and passes the result to `provePoolWithdraw({ aspInclusion })`.
+
+Roots are retained per pool — the most recent `maxSetsPerPool` files (default 50),
+oldest evicted first. A root that has been pruned is reported as `404` rather than
+being silently substituted with a different set.
 
 Bind host/port/CORS are configured via `ASP_HTTP_HOST` (default `127.0.0.1`),
 `ASP_HTTP_PORT` (default `8791`), and `ASP_CORS_ORIGIN` (default `*`).
