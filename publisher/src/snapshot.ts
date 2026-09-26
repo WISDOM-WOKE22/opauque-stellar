@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { getPoseidon, hashFields, TREE_DEPTH } from "./merkle.ts";
+import { getPoseidon, hashFields, buildRoot, TREE_DEPTH } from "./merkle.ts";
 import { bigintToHex32, hex32ToBytes } from "./bytes.ts";
 
 export interface SnapshotExport {
@@ -55,9 +55,7 @@ export async function buildTreeSnapshot(
   leaves: string[],
 ): Promise<SnapshotExport> {
   const leafValues = await buildSnapshotLeaves(leaves);
-  const poseidon = await getPoseidon();
-  const { default: buildMerkle } = await import("./merkle.ts");
-  const root = await buildMerkle.buildRoot(leafValues);
+  const root = await buildRoot(leafValues);
   const intermediateHashes = await buildIntermediateHashes(leafValues);
 
   return {

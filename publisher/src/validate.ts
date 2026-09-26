@@ -13,6 +13,11 @@ export interface InvalidCommitment {
 
 export type CommitmentValidation = ValidCommitment | InvalidCommitment;
 
+/// BN254 field modulus — leaf values must be strictly less than this.
+const BN254_MODULUS = BigInt(
+  "21888242871839275222246405745257275088548364400416034343698204186575808495617"
+);
+
 export function validateLeafCommitment(raw: unknown): CommitmentValidation {
   const errors: string[] = [];
   if (raw === null || raw === undefined || typeof raw !== "object") {
@@ -25,6 +30,11 @@ export function validateLeafCommitment(raw: unknown): CommitmentValidation {
   } else {
     try {
       normalizeHex32(obj.leaf, "leaf");
+      // Range-check: leaf value must be below the BN254 field modulus.
+      const leafValue = BigInt(obj.leaf);
+      if (leafValue < 0n || leafValue >= BN254_MODULUS) {
+        errors.push("leaf value must be a valid BN254 field element (0 <= value < modulus)");
+      }
     } catch {
       errors.push("leaf must be a 0x-prefixed 32-byte hex string");
     }
@@ -79,7 +89,8 @@ export function validateLeafCommitment(raw: unknown): CommitmentValidation {
       attestationUid: obj.attestationUid ? normalizeHex32(obj.attestationUid, "attestationUid") : undefined,
       txHash: typeof obj.txHash === "string" ? obj.txHash : undefined,
       ledger: typeof obj.ledger === "number" ? obj.ledger : undefined,
-      submittedAt: typeof obj.submittedAt === "string" ? obj.submittedAt : new Date().toISOString(),
+      // Server-assigned timestamp — never trust client-supplied submittedAt (#967)
+      submittedAt: new Date().toISOString(),
     },
   };
 }
