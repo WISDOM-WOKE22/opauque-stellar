@@ -128,4 +128,10 @@ To minimize exclusion risk:
 
 When `ASP_POLICY=allowlist` is active, any finalized deposit index absent from the operator allowlist is rejected and omitted from the published association set. Operators should keep the allowlist source under change control and use the persisted `rejectedIndices` in `asp/data/state/<poolId>.json` as the appeal/audit reference.
 
-If an appeal is accepted, add the deposit index to `ASP_ALLOWLIST_INDICES` or the configured allowlist file, restart or redeploy the ASP with the updated configuration, and let the next tick republish the association-set root. The published manifest will then include the appealed index, and clients can prove against the updated root.
+If an appeal is accepted, run the operator command below against the ASP data directory. It removes the persisted rejection and adds the index to the approved set immediately; the next tick republishes the association-set root.
+
+```sh
+npm --prefix asp run asp:reinstate -- --pool-id <pool-id> --index <deposit-index> --data-dir <asp-data-dir>
+```
+
+The command is deliberately limited to indices recorded as rejected and should be run under the operator's normal change-control process. The persisted policy decisions remain available for the audit trail.

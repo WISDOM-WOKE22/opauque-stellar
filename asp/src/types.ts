@@ -45,6 +45,19 @@ export interface PoolState {
   lastIndex: number;
   /** Ledger cursor for incremental event reads. */
   lastLedger: number;
+  /** Auditable policy decisions, including re-evaluations of deferred deposits. */
+  decisions?: PolicyDecisionRecord[];
+  /** Durable state-event cursor and accumulated state leaves. */
+  stateEventCursor?: number;
+  stateLeaves?: string[];
+}
+
+export interface PolicyDecisionRecord {
+  depositIndex: number;
+  policy: string;
+  verdict: PolicyVerdict;
+  reason: string;
+  timestamp: string;
 }
 
 /** Full state-tree snapshot reconstructed from Deposit + Withdraw events. */
@@ -55,6 +68,10 @@ export interface StateTreeSnapshot {
   eventCount: number;
   /** Highest leaf index present, or -1 when the pool is empty. */
   maxIndex: number;
+  /** Incremental event updates, when supplied by a chain adapter. */
+  events?: Array<{ index: number; leaf: string }>;
+  /** Next ledger cursor to persist after consuming this snapshot. */
+  cursor?: number;
 }
 
 /** A published association-set manifest (self-authenticating: anyone recomputes the root). */
@@ -85,7 +102,7 @@ export interface ChainAdapter {
   /** Latest finalized ledger (for the cursor). */
   latestLedger(): Promise<number>;
   /** Optional: rebuild all state-tree leaves from pool Deposit + Withdraw events. */
-  readStateLeaves?(): Promise<StateTreeSnapshot>;
+  readStateLeaves?(fromLedger?: number): Promise<StateTreeSnapshot>;
   /** Optional: latest published state root. */
   currentStateRoot?(): Promise<string | null>;
   /** Optional: publish a new state root. */

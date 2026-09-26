@@ -33,12 +33,12 @@ reproduce the hash and confirm it matches what the contract stores.
 ### ASP / pool-state root (`asp/src/publish.ts`)
 
 ```
-dataset_hash = "0x" || hex( SHA256( ordered_label_list ) )
+dataset_hash = "0x" || hex(SHA256(BE32(leaf_count) || root_bytes || leaf_0 || … || leaf_N-1))
 ```
 
-where the ordered label list is the labels written one per line (each label
-as a UTF-8 string followed by a newline `\n`). This is the set of approved
-deposit identifiers in the ASP Merkle tree.
+where `root_bytes` is the 32-byte ASP/state root and each decimal ASP label is
+encoded as a 32-byte big-endian field element. State leaves are already 32-byte
+hex values. This is the exact same byte layout used by the reputation publisher.
 
 ### Reputation publisher (`publisher/src/publish.ts`)
 
@@ -66,14 +66,12 @@ hash attests to both the root and the leaf set, not just the leaf set alone.
 
 ## Rationale
 
-The two publishers serve different data models:
+The two publishers serve different data models, but use one byte format:
 
-- The ASP tree is built over opaque labels (commitment identifiers); including
-  the root in the hash would be circular given that the ASP root is computed
-  from labels by the same process.
-- The reputation tree is built over 32-byte Poseidon leaf commitments; including
-  the root explicitly adds an additional binding layer that lets a verifier
-  check the root without rerunning the full Poseidon tree construction.
+- ASP labels are converted from decimal field elements to canonical 32-byte
+  big-endian values. The root is computed first, then included in the hash.
+- Reputation leaves are already canonical 32-byte values; the same root-binding
+  format therefore works without a service-specific branch.
 
 SHA256 was chosen over Poseidon for the dataset hash because: (a) it is
 universally available in Node.js via `node:crypto` without extra dependencies,
@@ -86,10 +84,8 @@ properties.
 - **Poseidon over all leaves:** Consistent with the on-chain tree structure,
   but slow for large lists off-chain and requires the circomlib dependency in
   every verifier tool. Rejected.
-- **A single unified format for both publishers:** Would require either the ASP
-  to bundle a root (adding a dependency on completion of tree construction) or
-  the reputation publisher to drop the root (losing the symmetric binding).
-  Rejected in favour of format fitness for each use case.
+- **Two service-specific formats:** Rejected because independent verification
+  tooling repeatedly implemented incompatible encodings.
 - **BLAKE3 or keccak256:** No strong reason to prefer either over SHA256 for
   this off-chain, non-circuit role. SHA256 chosen for ubiquity.
 
@@ -109,7 +105,7 @@ properties.
 
 ## Implementation notes
 
-- ASP: `asp/src/publish.ts` → `computeDatasetHash(labels: string[])`
+- ASP: `asp/src/publish.ts` → `computeDatasetHash(root, labels)`
 - Reputation publisher: `publisher/src/publish.ts` → `computeDatasetHash(root, leaves)`
 - The on-chain `RootEntry` struct (`contracts/privacy-pool/src/lib.rs`) stores
   `dataset_hash: BytesN<32>` alongside every root; the same pattern is used in
