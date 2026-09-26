@@ -10,7 +10,7 @@ restore verification, and retention policy for each service.
 |:--|:--|:--|
 | ASP | `asp/data/` | Approved-set membership decisions and incremental event cursor |
 | Publisher | `publisher/data/` | Holder-submitted leaf commitments (private, never on-chain) |
-| Relayer | `~/.opaque-relayer/` or the directory set by `RELAYER_DATA_DIR` | Job history and operator registration metadata |
+| Relayer hub (optional) | the directory set by `RELAYER_DATA_DIR` (contains `hub.json`); no default | Gossip-hub bids, outcomes, and operator stats. Only the hub persists, and only when `RELAYER_DATA_DIR` is set; a relayer node persists nothing, so there is nothing to back up when the variable is unset |
 
 The publisher's inbox is the most critical: leaf commitments are submitted off-chain by
 holders and cannot be reconstructed from public events. Losing them means affected
@@ -18,46 +18,21 @@ holders must resubmit their leaves.
 
 ## Backup script
 
-Save this as `/usr/local/bin/opaque-backup` and make it executable (`chmod +x`):
+The script ships in this repo as [`scripts/opaque-backup`](../scripts/opaque-backup)
+(tests: [`scripts/test-opaque-backup.sh`](../scripts/test-opaque-backup.sh)). Install it:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-BACKUP_ROOT="${OPAQUE_BACKUP_DIR:-/var/backups/opaque}"
-REPO_ROOT="${OPAQUE_REPO_ROOT:-/srv/opaque/stellar}"
-PASSPHRASE_FILE="${OPAQUE_BACKUP_PASSPHRASE_FILE:-/etc/opaque/backup-passphrase}"
-RETENTION_DAYS="${OPAQUE_BACKUP_RETENTION_DAYS:-30}"
-TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
-
-mkdir -p "$BACKUP_ROOT"
-
-backup_service() {
-  local name="$1"
-  local src="$2"
-  local dest="$BACKUP_ROOT/${name}-${TIMESTAMP}.tar.gz.gpg"
-
-  if [[ ! -d "$src" ]]; then
-    echo "SKIP: $name — $src does not exist"
-    return
-  fi
-
-  tar -czf - -C "$(dirname "$src")" "$(basename "$src")" \
-    | gpg --batch --yes --passphrase-file "$PASSPHRASE_FILE" \
-          --symmetric --cipher-algo AES256 \
-          -o "$dest"
-
-  echo "OK: $name -> $dest ($(du -sh "$dest" | cut -f1))"
-}
-
-backup_service asp       "$REPO_ROOT/asp/data"
-backup_service publisher "$REPO_ROOT/publisher/data"
-backup_service relayer   "${RELAYER_DATA_DIR:-$HOME/.opaque-relayer}"
-
-# Prune old backups
-find "$BACKUP_ROOT" -name "*.tar.gz.gpg" -mtime "+${RETENTION_DAYS}" -delete
-echo "Pruned backups older than ${RETENTION_DAYS} days"
+sudo install -m 0755 scripts/opaque-backup /usr/local/bin/opaque-backup
+sudo install -m 0755 scripts/opaque-verify-backup /usr/local/bin/opaque-verify-backup
 ```
+
+Preview what it would do without writing anything with `opaque-backup --dry-run`.
+It reads `ASP_DATA_DIR` / `PUBLISHER_DATA_DIR` (the same variables the services use;
+defaults `<repo>/asp/data` and `<repo>/publisher/data`) and `RELAYER_DATA_DIR`,
+skips anything that is not configured or does not exist, applies the per-service
+retention from the table below (`OPAQUE_BACKUP_RETENTION_DAYS` overrides all), and
+writes each archive atomically.
+
 
 Generate and store the passphrase once:
 
@@ -138,44 +113,11 @@ sudo systemctl start opaque-publisher
 
 ## Automated restore verification
 
-Save this as `/usr/local/bin/opaque-verify-backup` and schedule it weekly:
+The verifier ships as [`scripts/opaque-verify-backup`](../scripts/opaque-verify-backup)
+(installed above). It decrypts the newest backup of each service, extracts it into a
+temp directory, requires it to be non-empty, and exits non-zero on any failure (the
+relayer is checked only when `RELAYER_DATA_DIR` is set). Schedule it weekly.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-BACKUP_ROOT="${OPAQUE_BACKUP_DIR:-/var/backups/opaque}"
-PASSPHRASE_FILE="${OPAQUE_BACKUP_PASSPHRASE_FILE:-/etc/opaque/backup-passphrase}"
-RESTORE_TMP=$(mktemp -d)
-trap 'rm -rf "$RESTORE_TMP"' EXIT
-
-FAILURES=0
-
-for service in asp publisher relayer; do
-  latest=$(ls -t "$BACKUP_ROOT/${service}"-*.tar.gz.gpg 2>/dev/null | head -1)
-  if [[ -z "$latest" ]]; then
-    echo "FAIL: no backup found for $service"
-    FAILURES=$((FAILURES + 1))
-    continue
-  fi
-
-  if gpg --batch --passphrase-file "$PASSPHRASE_FILE" \
-         --decrypt "$latest" 2>/dev/null \
-       | tar -tzf - > /dev/null 2>&1; then
-    echo "OK: $service — $(basename "$latest") is readable"
-  else
-    echo "FAIL: $service — $(basename "$latest") failed integrity check"
-    FAILURES=$((FAILURES + 1))
-  fi
-done
-
-if [[ $FAILURES -gt 0 ]]; then
-  echo "Backup verification: $FAILURES failure(s)" >&2
-  exit 1
-fi
-
-echo "Backup verification: all services OK"
-```
 
 Schedule weekly:
 
@@ -191,9 +133,8 @@ Schedule weekly:
 | Publisher | 90 days | Leaf commitments are irreplaceable; longer retention protects against silent data loss |
 | Relayer | 30 days | Job history is informational; operator key and registration are the critical items |
 
-Override defaults by setting `OPAQUE_BACKUP_RETENTION_DAYS` in the backup script's
-environment before running it, or by setting separate retention values per service in
-a wrapper script.
+The script applies these per-service defaults automatically. Set
+`OPAQUE_BACKUP_RETENTION_DAYS` to override the retention for all services at once.
 
 ## Off-site replication
 
@@ -203,7 +144,7 @@ For production, replicate backups to a second location. Example using `rclone` t
 # Configure rclone once
 rclone config
 
-# Add to the backup script after the prune step
+# Run after opaque-backup, e.g. from a wrapper script or ExecStartPost
 rclone sync "$BACKUP_ROOT" s3:your-bucket/opaque-backups/ \
   --s3-sse AES256 \
   --log-level INFO

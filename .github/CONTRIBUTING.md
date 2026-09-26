@@ -579,13 +579,38 @@ rigor.
 
 | Workflow | Trigger | Blocking? | What it checks |
 |:---------|:--------|:----------|:----------------|
-| [`ci.yml`](workflows/ci.yml) | Every PR to `main`, every push to `main` | Yes | The main matrix (§ 6): frontend, contracts, circuits, scanner, scanner benchmark gate, poseidon crates, SDK, service images, and supply chain. The `circuits`, `scanner-crate`, and `poseidon-crates` jobs are path-gated. |
-| [`dependency-audit.yml`](workflows/dependency-audit.yml) | Every PR to `main`, weekly schedule, manual | **Partly** | `cargo audit` / `cargo deny check` / `npm audit` across root + `frontend/` are non-PR-blocking (`if: github.event_name != 'pull_request'`, § 12). The `scanner-audit` job — including the explicit wasm-bindgen advisory check — **is** PR-blocking. |
+| [`ci.yml`](workflows/ci.yml) | Every PR to `main`, every push to `main` | Yes | The main matrix (§ 6): frontend, contracts, circuits, scanner, scanner benchmark gate, poseidon crates, SDK, service images, and supply chain. The `circuits`, `scanner`, `scanner-crate`, `scanner-benchmark-gate`, `poseidon-crates`, `sdk`, `service-images`, `supply-chain`, and `backup-scripts` jobs are path-gated (see *Path filters in `ci.yml`* below). |
+| [`dependency-audit.yml`](workflows/dependency-audit.yml) | Every PR to `main`, weekly schedule, manual | **Partly** | `cargo audit` / `cargo deny check` / `npm audit` across root + `frontend/` run on the schedule / manual dispatch only (PRs get them from `ci.yml`'s `supply-chain` job, so each event runs them once; § 12). The `scanner-audit` job — including the explicit wasm-bindgen advisory check — **is** PR-blocking. |
 | [`codeql.yml`](workflows/codeql.yml) | Every PR to `main`, weekly schedule, manual | No (reports alerts) | CodeQL `security-extended` static analysis for `javascript-typescript` and `rust`. Alert triage responsibilities are in [`SECURITY.md`](../SECURITY.md). |
 | [`contracts-reproducible-build.yml`](workflows/contracts-reproducible-build.yml) | PR touching `contracts/**`, `Cargo.{toml,lock}`, `soroban.toml`, `deployments/v1/**` | Yes | Rebuilds the contracts workspace in the pinned image from `docker/reproducible-build.Dockerfile` and fails on a WASM hash mismatch against `deployments/v1/*.json`. See [docs/REPRODUCIBLE_BUILDS.md](../docs/REPRODUCIBLE_BUILDS.md). |
 | [`license-compliance.yml`](workflows/license-compliance.yml) | PR touching dependency manifests (`Cargo.lock`, `scanner/Cargo.lock`, `deny.toml`, `circuits/`, `frontend/` package manifests, `THIRD_PARTY_NOTICES.md`) | Yes | `cargo deny check licenses` plus `npm run notices:verify` — fails if `THIRD_PARTY_NOTICES.md` is stale or a new dependency's license isn't permissive-allowed or explicitly reviewed. See *Third-party notices* below. |
 | [`accessibility-audit.yml`](workflows/accessibility-audit.yml) | PR touching `frontend/**` | Yes | axe-core audit of the frontend's public views; fails on new critical/serious violations. See § 7.4. |
 | [`stale.yml`](workflows/stale.yml) | Daily schedule, manual | N/A (bot triage, not a check) | Labels and closes inactive issues/PRs. See § 14. |
+
+#### Path filters in `ci.yml`
+
+A `changes` job (`dorny/paths-filter`) decides which areas a change touches. The
+path-scoped jobs always start, so their check names always report and required
+status checks are satisfied on skipped runs, but they skip all their steps when
+none of their inputs changed. (Workflow-level `paths:` is not used in `ci.yml`
+because a workflow skipped that way leaves required checks pending.) Every job
+also runs in full when `ci.yml` itself changes.
+
+| Job | Runs its steps when these change |
+|:----|:---------------------------------|
+| `circuits` | `circuits/**` |
+| `scanner` (WASM + manifest checks) | `scanner/**`, `artifacts/**`, `circuits/**`, `deployments/**`, root `package*.json`, the build/verify/manifest scripts under `scripts/` |
+| `scanner-crate` | `scanner/**` |
+| `scanner-benchmark-gate` | `scanner/**`, `sdk/**`, `scripts/install-wasm-pack.sh` |
+| `poseidon-crates` | `contracts/opaque-poseidon/**`, `contracts/poseidon-bench/**` |
+| `sdk` | `sdk/**`, `scanner/**`, `deployments/**`, root `package*.json`, `scripts/generate-sdk-addresses.ts` |
+| `service-images` | `asp/**`, `publisher/**`, `relayer/**`, `deployments/**`, `.dockerignore` |
+| `supply-chain` | any `Cargo.toml`/`Cargo.lock`, `deny.toml`, any `package.json`/`package-lock.json` |
+| `backup-scripts` | `scripts/opaque-backup`, `scripts/opaque-verify-backup`, `scripts/test-opaque-backup.sh` |
+
+`frontend`, `contracts`, and `workflow-lint` still run on every PR. Advisories
+published against unchanged dependencies are caught by the weekly
+`dependency-audit.yml` schedule.
 
 The `contracts-reproducible-build.yml`, `license-compliance.yml`, and
 `accessibility-audit.yml` workflows are scoped to the paths they actually validate,

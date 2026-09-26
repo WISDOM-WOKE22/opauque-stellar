@@ -15,11 +15,102 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
+  # ── Change detection ────────────────────────────────────────────────
+  # One cheap job computes which areas a change touches. Path-scoped jobs
+  # below always START (so their check names always report, which keeps
+  # required status checks satisfiable) but skip their expensive steps when
+  # nothing they validate changed. We deliberately do NOT use workflow-level
+  # `paths:` filters: a workflow skipped that way leaves required checks
+  # "Pending" forever. Jobs also run in full whenever this file changes.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # dorny/paths-filter lists PR files via the API
+    outputs:
+      circuits: ${{ steps.filter.outputs.circuits }}
+      scanner-crate: ${{ steps.filter.outputs.scanner-crate }}
+      scanner-wasm: ${{ steps.filter.outputs.scanner-wasm }}
+      scanner-bench: ${{ steps.filter.outputs.scanner-bench }}
+      poseidon: ${{ steps.filter.outputs.poseidon }}
+      sdk: ${{ steps.filter.outputs.sdk }}
+      service-images: ${{ steps.filter.outputs.service-images }}
+      supply-chain: ${{ steps.filter.outputs.supply-chain }}
+      backup-scripts: ${{ steps.filter.outputs.backup-scripts }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            circuits:
+              - 'circuits/**'
+            scanner-crate:
+              - 'scanner/**'
+            poseidon:
+              - 'contracts/opaque-poseidon/**'
+              - 'contracts/poseidon-bench/**'
+            scanner-wasm:
+              - 'scanner/**'
+              - 'artifacts/**'
+              - 'circuits/**'
+              - 'deployments/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'scripts/build-scanner-wasm.ts'
+              - 'scripts/*artifact-manifest*'
+              - 'scripts/check-scanner-byte-stability.ts'
+              - 'scripts/embed-circuit-vk.ts'
+              - 'scripts/update-manifest-wasm-hashes.ts'
+              - '.github/workflows/ci.yml'
+            scanner-bench:
+              - 'scanner/**'
+              - 'sdk/**'
+              - 'scripts/install-wasm-pack.sh'
+              - '.github/workflows/ci.yml'
+            sdk:
+              - 'sdk/**'
+              - 'scanner/**'
+              - 'deployments/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'scripts/generate-sdk-addresses.ts'
+              - '.github/workflows/ci.yml'
+            service-images:
+              - 'asp/**'
+              - 'publisher/**'
+              - 'relayer/**'
+              - 'deployments/**'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+            supply-chain:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'deny.toml'
+              - '**/package.json'
+              - '**/package-lock.json'
+              - '.github/actions/install-audit-tools/**'
+              - '.github/workflows/ci.yml'
+            backup-scripts:
+              - 'scripts/opaque-backup'
+              - 'scripts/opaque-verify-backup'
+              - 'scripts/test-opaque-backup.sh'
+              - '.github/workflows/ci.yml'
+
   # ── Frontend: Node 20 / 22 ──────────────────────────────────────────
   frontend:
     name: Frontend (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +145,7 @@ jobs:
   contracts:
     name: Contracts (Rust ${{ matrix.rust-toolchain }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -90,20 +182,15 @@ jobs:
   circuits:
     name: Circuits regression
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 20
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.circuits == 'true'
         uses: actions/checkout@v4
 
-      - name: Detect circuit changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            circuits:
-              - 'circuits/**'
-
       - name: Setup Node.js 20
-        if: steps.changes.outputs.circuits == 'true'
+        if: needs.changes.outputs.circuits == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -111,37 +198,43 @@ jobs:
           cache-dependency-path: circuits/package-lock.json
 
       - name: Install circuit dependencies
-        if: steps.changes.outputs.circuits == 'true'
+        if: needs.changes.outputs.circuits == 'true'
         run: npm ci --prefix circuits
 
       - name: Install root dependencies (for tsx)
-        if: steps.changes.outputs.circuits == 'true'
+        if: needs.changes.outputs.circuits == 'true'
         run: npm ci
 
       - name: Run circuit regression suite
-        if: steps.changes.outputs.circuits == 'true'
+        if: needs.changes.outputs.circuits == 'true'
         run: npx tsx circuits/test/regression.ts --witness-only
 
   # ── Scanner WASM: Rust stable + Node 20 ─────────────────────────────
   scanner:
     name: Scanner WASM (Rust stable + Node 20)
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 30
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.scanner-wasm == 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust stable (pinned via scanner/rust-toolchain.toml)
+        if: needs.changes.outputs.scanner-wasm == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Setup Node.js 20
+        if: needs.changes.outputs.scanner-wasm == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
 
       - name: Cache cargo registry and build artifacts
+        if: needs.changes.outputs.scanner-wasm == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -151,43 +244,43 @@ jobs:
           key: ${{ runner.os }}-cargo-scanner-${{ hashFiles('scanner/Cargo.lock') }}
 
       - name: Install root dependencies
+        if: needs.changes.outputs.scanner-wasm == 'true'
         run: npm ci
 
       - name: Build scanner WASM
+        if: needs.changes.outputs.scanner-wasm == 'true'
         run: npm run build:scanner
 
       - name: Verify artifact manifest (scanner)
+        if: needs.changes.outputs.scanner-wasm == 'true'
         run: npx tsx scripts/verify-artifact-manifest.ts --scanner --strict
 
       - name: Verify embedded VK hash integrity
+        if: needs.changes.outputs.scanner-wasm == 'true'
         run: npx tsx scripts/verify-artifact-manifest.ts --vk-binding --strict
 
       - name: Byte-stability check (rebuild + compare hash)
+        if: needs.changes.outputs.scanner-wasm == 'true'
         run: npx tsx scripts/check-scanner-byte-stability.ts
   # ── Scanner crate: Rust stable (fmt + clippy + tests) ────────────────
   scanner-crate:
     name: Scanner crate (Rust stable)
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 30
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.scanner-crate == 'true'
         uses: actions/checkout@v4
 
-      - name: Detect relevant changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            scanner:
-              - 'scanner/**'
-
       - name: Install Rust stable
-        if: steps.changes.outputs.scanner == 'true'
+        if: needs.changes.outputs.scanner-crate == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo registry and build artifacts
-        if: steps.changes.outputs.scanner == 'true'
+        if: needs.changes.outputs.scanner-crate == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -197,17 +290,17 @@ jobs:
           key: ${{ runner.os }}-cargo-scanner-crate-${{ hashFiles('scanner/Cargo.lock') }}
 
       - name: Formatting
-        if: steps.changes.outputs.scanner == 'true'
+        if: needs.changes.outputs.scanner-crate == 'true'
         working-directory: scanner
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        if: steps.changes.outputs.scanner == 'true'
+        if: needs.changes.outputs.scanner-crate == 'true'
         working-directory: scanner
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        if: steps.changes.outputs.scanner == 'true'
+        if: needs.changes.outputs.scanner-crate == 'true'
         working-directory: scanner
         run: cargo test --workspace --locked
 
@@ -218,16 +311,21 @@ jobs:
   scanner-benchmark-gate:
     name: Scanner WASM benchmark regression gate
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 30
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.scanner-bench == 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust stable
+        if: needs.changes.outputs.scanner-bench == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Setup Node.js 20
+        if: needs.changes.outputs.scanner-bench == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -235,6 +333,7 @@ jobs:
           cache-dependency-path: sdk/package-lock.json
 
       - name: Cache cargo registry and build artifacts
+        if: needs.changes.outputs.scanner-bench == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -244,18 +343,22 @@ jobs:
           key: ${{ runner.os }}-cargo-scanner-bench-${{ hashFiles('scanner/Cargo.lock') }}
 
       - name: Install wasm-pack
+        if: needs.changes.outputs.scanner-bench == 'true'
         run: bash scripts/install-wasm-pack.sh
         env:
           WASM_PACK_INSTALL_DIR: /usr/local/bin
 
       - name: Install SDK dependencies
+        if: needs.changes.outputs.scanner-bench == 'true'
         run: npm ci --prefix sdk
 
       - name: Build scanner WASM (nodejs target)
+        if: needs.changes.outputs.scanner-bench == 'true'
         working-directory: scanner
         run: wasm-pack build --target nodejs --out-dir ../sdk/wasm-node-pkg --release
 
       - name: Run WASM scan throughput regression gate
+        if: needs.changes.outputs.scanner-bench == 'true'
         working-directory: sdk
         run: npm run benchmark:scan:gate
 
@@ -263,25 +366,19 @@ jobs:
   poseidon-crates:
     name: Poseidon crates (Rust stable)
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 30
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.poseidon == 'true'
         uses: actions/checkout@v4
 
-      - name: Detect relevant changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            poseidon:
-              - 'contracts/opaque-poseidon/**'
-              - 'contracts/poseidon-bench/**'
-
       - name: Install Rust stable
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build artifacts
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -292,32 +389,32 @@ jobs:
           key: ${{ runner.os }}-cargo-poseidon-${{ hashFiles('contracts/opaque-poseidon/Cargo.lock', 'contracts/poseidon-bench/Cargo.lock') }}
 
       - name: Formatting (opaque-poseidon)
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         working-directory: contracts/opaque-poseidon
         run: cargo fmt --all -- --check
 
       - name: Clippy (opaque-poseidon)
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         working-directory: contracts/opaque-poseidon
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests (opaque-poseidon, includes Poseidon constants vectors)
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         working-directory: contracts/opaque-poseidon
         run: cargo test --workspace --locked
 
       - name: Formatting (poseidon-bench)
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         working-directory: contracts/poseidon-bench
         run: cargo fmt --all -- --check
 
       - name: Clippy (poseidon-bench)
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         working-directory: contracts/poseidon-bench
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests (poseidon-bench)
-        if: steps.changes.outputs.poseidon == 'true'
+        if: needs.changes.outputs.poseidon == 'true'
         working-directory: contracts/poseidon-bench
         run: cargo test --workspace --locked
 
@@ -325,11 +422,15 @@ jobs:
   sdk:
     name: SDK (Node 20)
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 20
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.sdk == 'true'
         uses: actions/checkout@v4
 
       - name: Setup Node.js 20
+        if: needs.changes.outputs.sdk == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -337,33 +438,42 @@ jobs:
           cache-dependency-path: sdk/package-lock.json
 
       - name: Install SDK dependencies
+        if: needs.changes.outputs.sdk == 'true'
         run: npm ci --prefix sdk
 
       - name: Install root dependencies
+        if: needs.changes.outputs.sdk == 'true'
         run: npm ci
 
       - name: SDK address drift check
+        if: needs.changes.outputs.sdk == 'true'
         run: npx tsx scripts/generate-sdk-addresses.ts --check
 
       - name: Lint
+        if: needs.changes.outputs.sdk == 'true'
         run: npm run lint --prefix sdk
 
       - name: Typecheck
+        if: needs.changes.outputs.sdk == 'true'
         run: npm run typecheck --prefix sdk
 
       - name: Build
+        if: needs.changes.outputs.sdk == 'true'
         run: npm run build --prefix sdk
 
       - name: Export checks
+        if: needs.changes.outputs.sdk == 'true'
         run: npm run check:exports --prefix sdk
 
       - name: Tests
+        if: needs.changes.outputs.sdk == 'true'
         run: npm test --prefix sdk
 
   # ── Workflow lint: catch undefined npm run scripts ─────────────────────
   workflow-lint:
     name: Workflow script lint
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -375,18 +485,23 @@ jobs:
   service-images:
     name: Build ${{ matrix.service }} image
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         service: [asp, publisher, relayer]
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.service-images == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        if: needs.changes.outputs.service-images == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build ${{ matrix.service }} image
+        if: needs.changes.outputs.service-images == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -398,61 +513,79 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
       - name: Verify non-root runtime user
+        if: needs.changes.outputs.service-images == 'true'
         run: |
           user="$(docker run --rm --entrypoint id opaque-${{ matrix.service }}:ci -u)"
           echo "runtime user: $user"
           [ "$user" != "0" ]
 
       - name: Verify HEALTHCHECK is declared
+        if: needs.changes.outputs.service-images == 'true'
         run: |
           healthcheck="$(docker inspect --format='{{.Config.Healthcheck}}' opaque-${{ matrix.service }}:ci)"
           echo "$healthcheck"
           [ "$healthcheck" != "<nil>" ]
 
   # ── Supply chain: cargo audit + deny + npm audit ──────────────────────
+  # Sole cargo audit/deny pass for PRs and pushes; dependency-audit.yml runs
+  # its equivalent only on the weekly schedule / manual dispatch.
   supply-chain:
     name: Supply chain audit
     runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 30
     steps:
       - name: Checkout code
+        if: needs.changes.outputs.supply-chain == 'true'
         uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install cargo-audit and cargo-deny
-        run: cargo install cargo-audit cargo-deny --locked
+      - name: Install cargo-audit and cargo-deny (pinned, prebuilt)
+        if: needs.changes.outputs.supply-chain == 'true'
+        uses: ./.github/actions/install-audit-tools
 
       - name: cargo audit
+        if: needs.changes.outputs.supply-chain == 'true'
         run: cargo audit
 
       - name: cargo deny check
+        if: needs.changes.outputs.supply-chain == 'true'
         run: cargo deny check
 
       - name: Setup Node.js 20
+        if: needs.changes.outputs.supply-chain == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install root dependencies
+        if: needs.changes.outputs.supply-chain == 'true'
         run: npm ci
 
       - name: Install frontend dependencies
+        if: needs.changes.outputs.supply-chain == 'true'
         run: npm ci --prefix frontend
 
       - name: npm audit (root)
+        if: needs.changes.outputs.supply-chain == 'true'
         run: npm audit --omit=dev
         continue-on-error: true
 
       - name: npm audit (frontend)
+        if: needs.changes.outputs.supply-chain == 'true'
         run: npm audit --omit=dev --prefix frontend
         continue-on-error: true
+
+  # ── State backup scripts (docs/state-backups.md) ────────────────────
+  backup-scripts:
+    name: Backup scripts
+    runs-on: ubuntu-latest
+    needs: changes
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        if: needs.changes.outputs.backup-scripts == 'true'
+        uses: actions/checkout@v4
+
+      - name: Test opaque-backup and opaque-verify-backup
+        if: needs.changes.outputs.backup-scripts == 'true'
+        run: bash scripts/test-opaque-backup.sh

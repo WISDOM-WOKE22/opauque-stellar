@@ -25,8 +25,12 @@ manifest and verified by deployment/release gates, so a changed build input
 
 ### 2.1 Rust (contracts workspace)
 
-Routine: `cargo audit` + `cargo deny check` on a weekly schedule
-(`dependency-audit.yml`, `cargo-audit` job). Response windows are in
+Routine: `cargo audit` + `cargo deny check` run on every PR and push to `main`
+(the `supply-chain` job in `ci.yml`, path-gated to dependency changes) and on a
+weekly schedule (`dependency-audit.yml`, `cargo-audit` job, schedule/manual only
+so no event runs the pass twice). The tools are installed as pinned prebuilt
+binaries via `.github/actions/install-audit-tools` (single place to bump
+versions), not compiled from source. Response windows are in
 CONTRIBUTING.md § 12.
 
 ### 2.2 Rust WASM build chain (`scanner/`, wasm-pack)
@@ -81,7 +85,23 @@ hold, or accepted risk) must be:
 - Never silent: the ignore must reference the advisory ID and the tracking
   issue.
 
-## 5. References
+## 5. Workflow hardening baseline
+
+Every workflow in `.github/workflows/` must meet this baseline (issue #988):
+
+- **Least-privilege token.** A top-level `permissions:` block declares the
+  minimum. The default for a read-only check is `contents: read`. Grant more only
+  at the smallest scope that needs it (job level where possible), e.g.
+  `security-events: write` for CodeQL, `issues: write` + `pull-requests: write`
+  for the stale bot, `pull-requests: read` for the `changes` job's path detection.
+- **Every job has `timeout-minutes`**, sized at roughly 2-3x the normal runtime, so a
+  hung job cannot burn runner minutes for the 6-hour default.
+- **Pinned tooling.** Security tools installed in CI (`cargo-audit`, `cargo-deny`)
+  use explicit versions from the shared composite action.
+
+New workflows and new jobs must follow this baseline in review.
+
+## 6. References
 
 - [CONTRIBUTING.md § 12](../.github/CONTRIBUTING.md#12-dependency-update-policy)
 - [`dependency-audit.yml`](../.github/workflows/dependency-audit.yml)

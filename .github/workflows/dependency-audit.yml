@@ -19,30 +19,24 @@ on:
     - cron: "0 7 * * 1"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   cargo-audit:
     name: cargo audit / cargo deny (workspace)
-    if: github.event_name != 'pull_request'
+    # Weekly / manual only. PRs and pushes to main get this same audit + deny
+    # pass from the `supply-chain` job in ci.yml, so it runs once per event.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     continue-on-error: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install cargo-audit and cargo-deny
-        run: cargo install cargo-audit cargo-deny --locked
+      - name: Install audit tooling (pinned, prebuilt)
+        uses: ./.github/actions/install-audit-tools
 
       - name: cargo audit
         run: cargo audit
@@ -57,29 +51,28 @@ jobs:
     # workspace (#486). `cargo audit` exits non-zero when advisories are found,
     # which fails the check and blocks the PR until triaged within SLA.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
+      - name: Install cargo-audit (pinned, prebuilt)
+        uses: ./.github/actions/install-audit-tools
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            scanner/target
-          key: ${{ runner.os }}-scanner-cargo-${{ hashFiles('scanner/Cargo.lock') }}
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+          deny: "false"
 
       - name: cargo audit (scanner workspace)
+        # One audit pass: capture JSON once, print a readable summary, and let
+        # the next step reuse the same report for the wasm-bindgen check.
         working-directory: scanner
-        run: cargo audit
+        run: |
+          set +e
+          cargo audit --json > "$RUNNER_TEMP/scanner-audit.json"
+          rc=$?
+          set -e
+          jq -r '.vulnerabilities.list[] | "\(.package.name)@\(.package.version): \(.advisory.id) - \(.advisory.title)"' "$RUNNER_TEMP/scanner-audit.json"
+          exit $rc
 
       - name: Track wasm-bindgen advisories
         # Explicitly surface advisories that affect wasm-bindgen (or its direct
@@ -87,14 +80,14 @@ jobs:
         # audit pass. Fails the PR if any such advisory is present.
         working-directory: scanner
         run: |
-          advisories=$(cargo audit --json 2>/dev/null | jq -r '
+          advisories=$(jq -r '
             .vulnerabilities.list[]
             | select(.package.name == "wasm-bindgen"
                      or .package.name == "wasm-bindgen-backend"
                      or .package.name == "wasm-bindgen-macro"
                      or .package.name == "wasm-bindgen-macro-support")
             | "\(.package.name)@\(.package.version): \(.advisory.id) - \(.advisory.title)"
-          ')
+          ' "$RUNNER_TEMP/scanner-audit.json")
           if [ -n "$advisories" ]; then
             echo "::error::wasm-bindgen advisories detected — triage within SLA per CONTRIBUTING.md § 12:"
             echo "$advisories"
@@ -106,6 +99,7 @@ jobs:
     name: npm supply-chain audit
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: false
     steps:
       - name: Checkout code
