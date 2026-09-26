@@ -4,7 +4,7 @@
  * is optional and the file store is purely a convenience/cache.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, readdirSync, unlinkSync, renameSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, unlinkSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { SetManifest } from "./types.ts";
 
@@ -95,17 +95,27 @@ export function writeManifest(
 
 /**
  * Prune old set files, keeping only the most recent N (issue #1011).
- * Files are sorted by modification time (newest first).
+ * Ordered by modification time (newest first) so retention evicts the oldest
+ * roots. Filenames are root hashes, so sorting by name would evict an arbitrary
+ * set — including a root a withdrawing user is still proving against (#972).
  */
 function pruneOldSets(dir: string, maxKeep: number): void {
   try {
-    const files = readdirSync(dir)
+    const candidates = readdirSync(dir)
       .filter((f) => f.endsWith(".json") && f !== "latest.json" && !f.endsWith(".tmp"))
-      .sort()
-      .reverse(); // newest first (filename is root hash, lexicographic sort works)
+      .map((f) => {
+        let mtimeMs = 0;
+        try {
+          mtimeMs = statSync(join(dir, f)).mtimeMs;
+        } catch {
+          // Unreadable stat: fall back to 0 so it sorts last and is pruned first.
+        }
+        return { file: f, mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs); // newest first
 
-    if (files.length > maxKeep) {
-      for (const file of files.slice(maxKeep)) {
+    if (candidates.length > maxKeep) {
+      for (const { file } of candidates.slice(maxKeep)) {
         try {
           unlinkSync(join(dir, file));
         } catch {
