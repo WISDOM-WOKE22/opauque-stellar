@@ -62,6 +62,13 @@ export interface RelayerEngineConfig {
    * for a deadline the operator never had time to meet.
    */
   deadlineMarginLedgers?: number;
+  /**
+   * Called once a job this operator accepted has resolved, so the result can be
+   * gossiped to the hub for completion-rate scoring (#973). A throwing or
+   * rejecting hook is contained here — it must never turn a settled job into a
+   * failed payload delivery.
+   */
+  onSettled?: (jobId: string, result: "completed" | "failed") => void | Promise<void>;
 }
 
 export type RelayerEngineStats = {
@@ -245,6 +252,11 @@ export class RelayerEngine {
 
     const processPayload = async (): Promise<{ acceptedTx: string; submittedTx: string } | null> => {
       this.pendingJobs.set(payloadMsg.jobId.toLowerCase(), Date.now());
+      // An outcome is only owed for a job this operator actually accepted —
+      // anything that fails before accept_job (a hash mismatch, a job someone
+      // else already took) was never this operator's to complete, and reporting
+      // it would let a third party drag the completion-rate score down.
+      let acceptedJob = false;
       try {
         const plaintext = openBox(payloadMsg.box, this.cfg.x25519SecretKey);
         const payload = decodePoolWithdrawPayload(plaintext);
@@ -255,6 +267,7 @@ export class RelayerEngine {
         }
         await this.cfg.chain.simulatePoolWithdraw(payload);
         const acceptedTx = await this.cfg.chain.acceptJob(payloadMsg.jobId);
+        acceptedJob = true;
         this.stats.accepted += 1;
         const submittedTx = await this.cfg.chain.submitPoolWithdraw(payloadMsg.jobId, payload);
         this.stats.submitted += 1;
@@ -268,6 +281,8 @@ export class RelayerEngine {
           submittedAt: Date.now(),
         });
 
+        await this.notifySettled(payloadMsg.jobId, "completed");
+
         if (payloadMsg.idempotencyKey) {
           this.idempotencyStore.set(payloadMsg.idempotencyKey, {
             result,
@@ -279,6 +294,9 @@ export class RelayerEngine {
       } catch (err) {
         this.stats.rejected += 1;
         this.stats.lastError = err instanceof Error ? err.message : String(err);
+        if (acceptedJob) {
+          await this.notifySettled(payloadMsg.jobId, "failed");
+        }
         throw err;
       } finally {
         this.pendingJobs.delete(payloadMsg.jobId.toLowerCase());
@@ -296,9 +314,26 @@ export class RelayerEngine {
     return processPayload();
   }
 
+  /**
+   * Report a settled job to the `onSettled` hook. Awaited so that by the time
+   * `handlePayload` resolves the outcome has actually been published — a
+   * completed job that is never reported leaves the operator permanently
+   * unscored at the hub. A throwing or rejecting hook is contained here: the job
+   * is already on-chain, so failing the delivery would be strictly worse than
+   * losing the completion-rate datapoint.
+   */
+  private async notifySettled(jobId: string, result: "completed" | "failed"): Promise<void> {
+    const hook = this.cfg.onSettled;
+    if (!hook) return;
+    try {
+      await hook(jobId, result);
+    } catch (err) {
+      this.stats.lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
   /** Prune expired entries from memory maps. Runs on a timer. Safe to call multiple times. */
-  startPruneWatch(intervalMs: number = 60 * 60 * 1000): void {
-    if (this.pruneTimer !== null) return;
+  startPruneWatch(intervalMs: number = 60 * 60 * 1000): void {    if (this.pruneTimer !== null) return;
     this.pruneTimer = setInterval(() => this.prune(), intervalMs);
   }
 
