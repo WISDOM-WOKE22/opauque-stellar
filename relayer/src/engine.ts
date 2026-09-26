@@ -3,6 +3,8 @@ import { openBox } from "./shared/box.ts";
 import {
   decodePoolWithdrawPayload,
   hashPoolWithdrawPayloadHex,
+  serializePoolWithdrawPayload,
+  parsePoolWithdrawPayload,
   type PoolWithdrawPayload,
 } from "./shared/payload.ts";
 import { bytesToHex } from "./shared/bytes.ts";
@@ -15,6 +17,7 @@ import {
   type RelayerBid,
 } from "./messages.ts";
 import type { JobLedger } from "./reconciler.ts";
+import type { AcceptedJobQueue } from "./job-queue.ts";
 
 export type OnChainJob = {
   exists: boolean;
@@ -69,7 +72,26 @@ export interface RelayerEngineConfig {
    * failed payload delivery.
    */
   onSettled?: (jobId: string, result: "completed" | "failed") => void | Promise<void>;
+  /**
+   * Durable queue of accepted-but-unsubmitted jobs (#975). When present, a job is
+   * recorded here *before* the submit is attempted, so a crash in between is
+   * recovered on the next boot by {@link resumeAcceptedJobs} instead of leaving
+   * a bonded job nobody submits.
+   */
+  acceptedJobs?: AcceptedJobQueue;
+  /** Submit retry policy (#975). Defaults to {@link DEFAULT_SUBMIT_RETRY}. */
+  submitRetry?: SubmitRetryPolicy;
 }
+
+export type SubmitRetryPolicy = {
+  /** Total submit attempts, including the first. */
+  maxAttempts: number;
+  /** First backoff step; doubles per attempt, plus jitter. */
+  baseDelayMs: number;
+};
+
+/** Accept-then-submit retry default: three attempts over ~7s (#975). */
+const DEFAULT_SUBMIT_RETRY: SubmitRetryPolicy = { maxAttempts: 3, baseDelayMs: 1000 };
 
 export type RelayerEngineStats = {
   jobsSeen: number;
@@ -134,11 +156,17 @@ export class RelayerEngine {
   private pruneTimer: ReturnType<typeof setInterval> | null = null;
   private startedAt: number;
   private readonly deadlineMarginLedgers: number;
+  private readonly submitRetry: SubmitRetryPolicy;
 
   constructor(private cfg: RelayerEngineConfig) {
     this.startedAt = Date.now();
     const margin = cfg.deadlineMarginLedgers ?? DEFAULT_DEADLINE_MARGIN_LEDGERS;
     this.deadlineMarginLedgers = Number.isFinite(margin) && margin >= 0 ? margin : DEFAULT_DEADLINE_MARGIN_LEDGERS;
+    const retry = cfg.submitRetry ?? DEFAULT_SUBMIT_RETRY;
+    this.submitRetry = {
+      maxAttempts: Number.isInteger(retry.maxAttempts) && retry.maxAttempts > 0 ? retry.maxAttempts : DEFAULT_SUBMIT_RETRY.maxAttempts,
+      baseDelayMs: Number.isFinite(retry.baseDelayMs) && retry.baseDelayMs >= 0 ? retry.baseDelayMs : DEFAULT_SUBMIT_RETRY.baseDelayMs,
+    };
   }
 
   bidsFor(jobId: string): RelayerBid[] {
@@ -269,9 +297,25 @@ export class RelayerEngine {
         const acceptedTx = await this.cfg.chain.acceptJob(payloadMsg.jobId);
         acceptedJob = true;
         this.stats.accepted += 1;
-        const submittedTx = await this.cfg.chain.submitPoolWithdraw(payloadMsg.jobId, payload);
+
+        // Durably record the acceptance *before* submitting (#975): from here the
+        // job is bonded to this operator, so a crash before the submit lands must
+        // be recoverable rather than a guaranteed slash.
+        await this.cfg.acceptedJobs?.enqueue({
+          jobId: payloadMsg.jobId,
+          acceptedTx,
+          payload: serializePoolWithdrawPayload(payload),
+          deadline: job.deadline,
+          fee: job.fee.toString(),
+          acceptedAt: Date.now(),
+          attempts: 0,
+        });
+
+        const submittedTx = await this.submitWithRetry(payloadMsg.jobId, payload, job.deadline);
         this.stats.submitted += 1;
         const result = { acceptedTx, submittedTx };
+
+        await this.cfg.acceptedJobs?.resolve(payloadMsg.jobId);
 
         this.cfg.jobLedger?.record({
           jobId: payloadMsg.jobId,
@@ -312,6 +356,95 @@ export class RelayerEngine {
     }
 
     return processPayload();
+  }
+
+  /**
+   * Submit an accepted job, retrying with exponential backoff plus jitter while
+   * there is still deadline headroom left (#975).
+   *
+   * Retries stop as soon as the job is within the deadline margin: at that point
+   * a submit can no longer land before the deadline, so burning attempts only
+   * delays the inevitable and the stake is better spent on the next job.
+   */
+  private async submitWithRetry(
+    jobId: string,
+    payload: PoolWithdrawPayload,
+    deadline: number,
+  ): Promise<string> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= this.submitRetry.maxAttempts; attempt += 1) {
+      try {
+        return await this.cfg.chain.submitPoolWithdraw(jobId, payload);
+      } catch (err) {
+        lastError = err;
+        await this.cfg.acceptedJobs?.recordFailure(jobId, err instanceof Error ? err.message : String(err));
+        if (attempt >= this.submitRetry.maxAttempts) break;
+        if (!(await this.hasDeadlineHeadroom(deadline))) break;
+        const jitterMs = Math.random() * this.submitRetry.baseDelayMs;
+        await sleep(this.submitRetry.baseDelayMs * 2 ** (attempt - 1) + jitterMs);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  /** Whether `deadline` still clears the configured margin against the chain head. */
+  private async hasDeadlineHeadroom(deadline: number): Promise<boolean> {
+    try {
+      const latestLedger = await this.cfg.chain.latestLedger();
+      return deadline - latestLedger >= this.deadlineMarginLedgers;
+    } catch {
+      // Unknown head — assume there is still time rather than abandoning a bond.
+      return true;
+    }
+  }
+
+  /**
+   * Finish any job that was accepted but never submitted, then report what
+   * happened (#975). Called on boot: this is what turns a crash between
+   * `accept_job` and `submit_pool_withdraw` into a completed payout instead of a
+   * slash.
+   *
+   * A job whose deadline is already inside the margin is dropped rather than
+   * submitted — the window has closed, so the attempt could only fail.
+   */
+  async resumeAcceptedJobs(): Promise<{ submitted: string[]; abandoned: string[]; failed: string[] }> {
+    const queue = this.cfg.acceptedJobs;
+    const submitted: string[] = [];
+    const abandoned: string[] = [];
+    const failed: string[] = [];
+    if (!queue) return { submitted, abandoned, failed };
+
+    await queue.hydrate();
+    for (const entry of queue.pending()) {
+      if (!(await this.hasDeadlineHeadroom(entry.deadline))) {
+        await queue.resolve(entry.jobId);
+        abandoned.push(entry.jobId);
+        continue;
+      }
+      try {
+        // Parsed inside the try: one corrupt stored entry must not abort the whole
+        // recovery pass and keep the node from starting.
+        const payload = parsePoolWithdrawPayload(entry.payload);
+        const submittedTx = await this.submitWithRetry(entry.jobId, payload, entry.deadline);
+        await queue.resolve(entry.jobId);
+        this.cfg.jobLedger?.record({
+          jobId: entry.jobId,
+          acceptedTx: entry.acceptedTx,
+          submittedTx,
+          expectedFee: BigInt(entry.fee),
+          submittedAt: Date.now(),
+        });
+        this.stats.submitted += 1;
+        await this.notifySettled(entry.jobId, "completed");
+        submitted.push(entry.jobId);
+      } catch (err) {
+        // Left queued: the next boot (or a later resume) tries again. Dropping it
+        // here would silently abandon a bond.
+        this.stats.lastError = err instanceof Error ? err.message : String(err);
+        failed.push(entry.jobId);
+      }
+    }
+    return { submitted, abandoned, failed };
   }
 
   /**
@@ -365,3 +498,5 @@ export class RelayerEngine {
 function normalizeHex(value: string): string {
   return value.toLowerCase().replace(/^0x/, "");
 }
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

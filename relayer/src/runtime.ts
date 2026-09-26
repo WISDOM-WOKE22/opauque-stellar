@@ -13,11 +13,12 @@
  * integration test exercise exactly the same code path.
  */
 import { Keypair } from "@stellar/stellar-sdk";
-import { RelayerEngine, type RelayerChainAdapter } from "./engine.ts";
+import { RelayerEngine, type RelayerChainAdapter, type SubmitRetryPolicy } from "./engine.ts";
 import { attachRelayerEngineToGossip } from "./hub.ts";
 import type { GossipTransport } from "./gossip.ts";
 import { JobLedger, PayoutReconciler } from "./reconciler.ts";
-import type { LedgerStore } from "./store.ts";
+import { AcceptedJobQueue } from "./job-queue.ts";
+import type { AcceptedJobStore, LedgerStore } from "./store.ts";
 import { createLogger, type Logger } from "./logger.ts";
 
 /** Default gap between scheduled reconciliation runs (5 minutes). */
@@ -40,6 +41,10 @@ export interface RelayerNodeOptions {
   transport: GossipTransport;
   /** Where accepted jobs are recorded. Omit for an in-memory ledger. */
   ledgerStore?: LedgerStore;
+  /** Where accepted-but-unsubmitted jobs are recorded so a restart can resume (#975). */
+  acceptedJobStore?: AcceptedJobStore;
+  /** Submit retry policy for the accept-then-submit sequence (#975). */
+  submitRetry?: SubmitRetryPolicy;
   /** 0 disables scheduled reconciliation (the boot check still runs). */
   reconcileIntervalMs?: number;
   /** 0 disables the heartbeat timer (one heartbeat is still published). */
@@ -52,6 +57,7 @@ export interface RelayerNode {
   engine: RelayerEngine;
   ledger: JobLedger;
   reconciler: PayoutReconciler;
+  acceptedJobs: AcceptedJobQueue;
   /** Publish one heartbeat immediately. Also runs on the heartbeat timer. */
   publishHeartbeat(): Promise<void>;
   /** Stop the heartbeat timer, the reconciler, and the engine's prune watch. */
@@ -76,6 +82,14 @@ export async function startRelayerNode(opts: RelayerNodeOptions): Promise<Relaye
     log.info("job ledger hydrated", { entries: ledger.size() });
   }
 
+  // Accepted-but-unsubmitted jobs from a previous run (#975). Hydrated here so the
+  // engine can finish them below before this node starts accepting new work.
+  const acceptedJobs = new AcceptedJobQueue(opts.acceptedJobStore);
+  await acceptedJobs.hydrate();
+  if (acceptedJobs.size() > 0) {
+    log.info("accepted jobs recovered from disk", { pending: acceptedJobs.size() });
+  }
+
   const engine = new RelayerEngine({
     operator: opts.operator,
     x25519PublicKey: opts.x25519PublicKey,
@@ -85,6 +99,8 @@ export async function startRelayerNode(opts: RelayerNodeOptions): Promise<Relaye
     chain: opts.chain,
     jobLedger: ledger,
     deadlineMarginLedgers: opts.deadlineMarginLedgers,
+    acceptedJobs,
+    submitRetry: opts.submitRetry,
     // The hub scores completion rate from outcomes it receives over gossip, so
     // a settled job has to be reported or the operator stays unscored forever.
     onSettled: async (jobId, result) => {
@@ -111,6 +127,18 @@ export async function startRelayerNode(opts: RelayerNodeOptions): Promise<Relaye
       });
     },
   });
+
+  // Finish any job that was accepted but not submitted before this process died
+  // (#975). A crash between accept_job and submit_pool_withdraw would otherwise
+  // leave a bonded job nobody submits, ending in a slash.
+  const resumed = await engine.resumeAcceptedJobs();
+  if (resumed.submitted.length > 0 || resumed.abandoned.length > 0 || resumed.failed.length > 0) {
+    log.info("accepted-job recovery complete", {
+      submitted: resumed.submitted.length,
+      abandoned: resumed.abandoned.length,
+      failed: resumed.failed.length,
+    });
+  }
 
   // Verify restored entries against the chain before serving: entries whose jobs
   // are gone (reorg, contract migration) are dropped, real fee/status mismatches
@@ -150,6 +178,7 @@ export async function startRelayerNode(opts: RelayerNodeOptions): Promise<Relaye
     engine,
     ledger,
     reconciler,
+    acceptedJobs,
     publishHeartbeat,
     stop: async () => {
       if (heartbeatTimer) clearInterval(heartbeatTimer);

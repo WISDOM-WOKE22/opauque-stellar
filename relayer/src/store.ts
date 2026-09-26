@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import type { RelayerBid } from "./messages.ts";
 import type { RelayerHubStats } from "./hub.ts";
 import type { JobLedgerEntry } from "./reconciler.ts";
+import type { AcceptedJobEntry } from "./job-queue.ts";
 
 // ---------------------------------------------------------------------------
 // Hub state (serialisable snapshot of RelayerHub internals)
@@ -38,6 +39,16 @@ export interface HubStore {
 export interface LedgerStore {
   load(): Promise<JobLedgerEntry[] | null>;
   save(entries: JobLedgerEntry[]): Promise<void>;
+  clear(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Accepted-jobs store (accepted but not yet submitted — issue #975)
+// ---------------------------------------------------------------------------
+
+export interface AcceptedJobStore {
+  load(): Promise<AcceptedJobEntry[] | null>;
+  save(entries: AcceptedJobEntry[]): Promise<void>;
   clear(): Promise<void>;
 }
 
@@ -101,12 +112,29 @@ export class MemoryLedgerStore implements LedgerStore {
   }
 }
 
+export class MemoryAcceptedJobStore implements AcceptedJobStore {
+  private entries: AcceptedJobEntry[] | null = null;
+
+  async load(): Promise<AcceptedJobEntry[] | null> {
+    return this.entries;
+  }
+
+  async save(entries: AcceptedJobEntry[]): Promise<void> {
+    this.entries = entries;
+  }
+
+  async clear(): Promise<void> {
+    this.entries = null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // File-backed implementations
 // ---------------------------------------------------------------------------
 
 const HUB_FILE = "hub.json";
 const LEDGER_FILE = "ledger.json";
+const ACCEPTED_JOBS_FILE = "accepted-jobs.json";
 const STATE_VERSION = 1;
 
 function ensureDir(filePath: string): void {
@@ -226,6 +254,39 @@ export class FileLedgerStore implements LedgerStore {
       },
       serialiseBigInt,
     );
+  }
+
+  async clear(): Promise<void> {
+    try {
+      const { unlinkSync } = await import("node:fs");
+      unlinkSync(this.filePath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Accepted-but-unsubmitted jobs, persisted so a crash between `accept_job` and
+ * `submit_pool_withdraw` is recoverable on the next boot (#975). Entries hold
+ * only plain JSON — the payload is pre-serialized and the fee is a decimal
+ * string — so no bigint encoding is needed here.
+ */
+export class FileAcceptedJobStore implements AcceptedJobStore {
+  private filePath: string;
+
+  constructor(dataDir: string) {
+    this.filePath = join(dataDir, ACCEPTED_JOBS_FILE);
+  }
+
+  async load(): Promise<AcceptedJobEntry[] | null> {
+    const raw = readJsonFile<{ version?: number; entries: AcceptedJobEntry[] }>(this.filePath);
+    if (!raw || raw.version !== STATE_VERSION) return null;
+    return raw.entries ?? [];
+  }
+
+  async save(entries: AcceptedJobEntry[]): Promise<void> {
+    writeJsonFile(this.filePath, { version: STATE_VERSION, entries });
   }
 
   async clear(): Promise<void> {

@@ -7,7 +7,7 @@ import { createRelayerHttpServer } from "../src/http.ts";
 import { HttpGossipTransport, MemoryGossipTransport } from "../src/gossip.ts";
 import { RelayerHub } from "../src/hub.ts";
 import { StellarRelayerChain } from "../src/chains/stellar.ts";
-import { FileLedgerStore } from "../src/store.ts";
+import { FileAcceptedJobStore, FileLedgerStore } from "../src/store.ts";
 import { DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_RECONCILE_INTERVAL_MS, startRelayerNode } from "../src/runtime.ts";
 import { generateX25519Keypair } from "../src/shared/box.ts";
 import { bytesToHex, hexToBytes } from "../src/shared/bytes.ts";
@@ -90,8 +90,10 @@ const node = await startRelayerNode({
   chain,
   transport,
   // Accepted jobs are persisted so a restart can reconcile them against the chain
-  // instead of starting blind.
+  // instead of starting blind, and accepted-but-unsubmitted jobs are persisted so
+  // a restart can finish them instead of slashing the bond (#975).
   ledgerStore: new FileLedgerStore(dataDir),
+  acceptedJobStore: new FileAcceptedJobStore(dataDir),
   reconcileIntervalMs,
   heartbeatIntervalMs,
   deadlineMarginLedgers,

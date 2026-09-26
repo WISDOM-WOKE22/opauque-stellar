@@ -1,5 +1,8 @@
 import type { RelayerChainAdapter } from "./engine.ts";
 import type { LedgerStore } from "./store.ts";
+import { createLogger } from "./logger.ts";
+
+const log = createLogger("relayer");
 
 // ---------------------------------------------------------------------------
 // Job ledger
