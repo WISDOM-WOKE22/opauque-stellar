@@ -29,6 +29,9 @@ import { FeatureDisabledNotice } from "./components/FeatureDisabledNotice";
 import { getTabAccess } from "./lib/tabAccess";
 import { getFeatureFlags } from "./lib/featureFlags";
 import { SessionTimeoutProvider } from "./components/security/SessionTimeoutProvider";
+import { useHistoryReconciliation } from "./hooks/useHistoryReconciliation";
+import { startPendingTxTracking } from "./lib/txTracking";
+import { horizonTxStatusFetcher } from "./lib/chainHistoryFetchers";
 
 const SchemaStudio = lazy(() => import("./components/SchemaStudio").then((m) => ({ default: m.SchemaStudio })));
 const AttestationManager = lazy(() => import("./components/AttestationManager").then((m) => ({ default: m.AttestationManager })));
@@ -72,6 +75,9 @@ function AppContent() {
     useGhostAddressStore.getState().sanitizeGhostAddresses();
   }, []);
 
+  // Resume in-flight transactions persisted before a reload (#114).
+  useEffect(() => startPendingTxTracking({ fetchStatus: horizonTxStatusFetcher }), []);
+
   useEffect(() => {
     const requestedTab = (location.state as { tab?: Tab } | null)?.tab;
     if (location.pathname === "/app" && requestedTab) {
@@ -85,6 +91,14 @@ function AppContent() {
   }, [cluster]);
 
   const showDashboard = isRegistered || registrationJustCompleted;
+  // Fresh device / cleared storage: rebuild history from chain (#113).
+  useHistoryReconciliation({
+    cluster: cluster ?? "",
+    address,
+    enabled: isConnected && cluster != null && showDashboard,
+    autoOnEmpty: true,
+  });
+
   const showRegistrationWizard = isSetup && isConnected && address && cluster != null && !showDashboard && !isRegistrationCheckLoading;
 
   const handleRegistrationComplete = useCallback(() => {

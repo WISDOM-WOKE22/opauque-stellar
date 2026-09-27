@@ -26,6 +26,9 @@ const txHistoryStorage = createEncryptedStorage<TxHistoryState>(
 
 export type TxHistoryKind = "sent" | "received" | "ghost" | "trait";
 
+/** On-chain state of an entry's transaction (#113/#114). Absent = confirmed. */
+export type TxHistoryChainStatus = "confirmed" | "failed" | "pending";
+
 export type TxHistoryEntry = {
   id: string;
   cluster: string;
@@ -38,6 +41,7 @@ export type TxHistoryEntry = {
   txHash?: string;
   stealthAddress?: string;
   timestamp: number;
+  chainStatus?: TxHistoryChainStatus;
 };
 
 export type TxHistoryPushInput = Omit<TxHistoryEntry, "id" | "timestamp">;
@@ -57,6 +61,10 @@ type TxHistoryState = {
   byChain: Record<string, TxHistoryEntry[]>;
   push: (entry: TxHistoryPushInput) => void;
   getForCluster: (cluster: string) => TxHistoryEntry[];
+  /** Replace a cluster's list with a chain-reconciled one (#113). */
+  replaceForCluster: (cluster: string, entries: TxHistoryEntry[]) => void;
+  /** Update the chain status of every entry carrying `txHash` (#114). */
+  setChainStatus: (txHash: string, status: TxHistoryChainStatus) => void;
   clearForCluster: (cluster: string) => void;
   clear: () => void;
 };
@@ -100,6 +108,28 @@ export const useTxHistoryStore = create<TxHistoryState>()(
         const list = byChain[cluster];
         return Array.isArray(list) ? list.slice() : [];
       },
+
+      replaceForCluster: (cluster, entries) =>
+        set((state) => ({
+          byChain: {
+            ...state.byChain,
+            [cluster]: entries.slice(0, MAX_ITEMS_PER_CLUSTER),
+          },
+        })),
+
+      setChainStatus: (txHash, status) =>
+        set((state) => {
+          let changed = false;
+          const byChain: Record<string, TxHistoryEntry[]> = {};
+          for (const [cluster, list] of Object.entries(state.byChain)) {
+            byChain[cluster] = list.map((e) => {
+              if (e.txHash !== txHash || e.chainStatus === status) return e;
+              changed = true;
+              return { ...e, chainStatus: status };
+            });
+          }
+          return changed ? { byChain } : state;
+        }),
 
       clearForCluster: (cluster) =>
         set((state) => ({
