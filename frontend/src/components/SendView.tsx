@@ -31,7 +31,7 @@ import { deployedAddresses } from "../contracts/deployedAddresses";
 import { ProtocolStepper } from "./ProtocolStepper";
 import type { ProtocolStep } from "./ProtocolStepper";
 import { useProtocolLog } from "../context/ProtocolLogContext";
-import { useTxHistoryStore } from "../store/txHistoryStore";
+import { markPendingTx, resolvePendingTx, trackSubmission } from "../lib/txTracking";
 import { PrivacyWarningCallout } from "./PrivacyWarningCallout";
 import { SEND_PRIVACY_WARNING } from "../lib/privacyThreatModel";
 import { QrScanner } from "./QrScanner";
@@ -58,7 +58,6 @@ export function SendView() {
   const { isSetup } = useKeys();
   const { publicKey, signTransaction, connected } = useWallet();
   const { push: logPush } = useProtocolLog();
-  const pushTx = useTxHistoryStore((s) => s.push);
   const network = getNetwork();
   const currentConfig = getConfigForCluster(network);
   const address = publicKey;
@@ -255,27 +254,35 @@ export function SendView() {
         signedTransferXdr,
         passphrase,
       );
-      const transferResult = await horizon.submitTransaction(signedTransfer);
-      const transferHash = transferResult.hash;
+      // Track the transfer under its precomputed hash before submitting, so
+      // a reload mid-submission still resolves it and records the payment
+      // (#114). The history row is recorded now even if the announcement
+      // below fails: funds have moved and the announcement can be retried.
+      const transferHash = signedTransfer.hash().toString("hex");
+      await trackSubmission(
+        {
+          txHash: transferHash,
+          cluster: network,
+          kind: "send",
+          history: {
+            cluster: network,
+            kind: "sent",
+            counterparty:
+              stealthStellarAddress.slice(0, 6) +
+              "…" +
+              stealthStellarAddress.slice(-4),
+            amountStroops: value.toString(),
+            tokenSymbol: "XLM",
+            tokenAddress: null,
+            amount: formatXlm(value),
+            txHash: transferHash,
+          },
+        },
+        () => horizon.submitTransaction(signedTransfer),
+      );
       setTxHash(transferHash);
       addStep("ok", "Transfer confirmed.", transferHash);
       logPush("blockchain", `Transfer: ${transferHash.slice(0, 18)}…`);
-
-      // Record the payment now: funds have moved even if the announcement
-      // below fails (it can be retried without re-sending funds).
-      pushTx({
-        cluster: network,
-        kind: "sent",
-        counterparty:
-          stealthStellarAddress.slice(0, 6) +
-          "…" +
-          stealthStellarAddress.slice(-4),
-        amountStroops: value.toString(),
-        tokenSymbol: "XLM",
-        tokenAddress: null,
-        amount: formatXlm(value),
-        txHash: transferHash,
-      });
 
       // 2) Publish the stealth announcement so the recipient can discover the
       //    payment by scanning. Submitted as its own Soroban transaction.
@@ -306,14 +313,17 @@ export function SendView() {
       const announceSend = await soroban.sendTransaction(signedAnnounce);
       if (announceSend.status === "ERROR")
         throw new Error(JSON.stringify(announceSend));
+      markPendingTx({ txHash: announceSend.hash, cluster: network, kind: "send" });
       let announceResp = await soroban.getTransaction(announceSend.hash);
       while (announceResp.status === "NOT_FOUND") {
         await new Promise((r) => setTimeout(r, 1000));
         announceResp = await soroban.getTransaction(announceSend.hash);
       }
       if (announceResp.status !== "SUCCESS") {
+        resolvePendingTx(announceSend.hash, "failed", announceResp.status);
         throw new Error(`Announcement failed: ${announceResp.status}`);
       }
+      resolvePendingTx(announceSend.hash, "confirmed");
       addStep("done", "Announcement published.", announceSend.hash);
       logPush("blockchain", `Announce: ${announceSend.hash.slice(0, 18)}…`);
     } catch (e) {

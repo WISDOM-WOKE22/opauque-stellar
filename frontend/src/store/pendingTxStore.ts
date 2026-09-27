@@ -19,6 +19,7 @@
 
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+import type { TxHistoryPushInput } from "./txHistoryStore";
 
 export type PendingTxStatus = "pending" | "confirmed" | "failed" | "timed_out";
 
@@ -32,6 +33,11 @@ export interface PendingTxEntry {
   message?: string;
   /** When the entry first reached a terminal status (drives cleanup). */
   resolvedAt?: number;
+  /**
+   * History row to record for this tx. Persisted with the entry so a reload
+   * between submit and confirmation still lands the row in history.
+   */
+  history?: TxHistoryPushInput;
 }
 
 function isTerminalStatus(status: PendingTxStatus): boolean {

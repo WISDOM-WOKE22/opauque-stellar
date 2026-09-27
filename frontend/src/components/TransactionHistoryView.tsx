@@ -4,6 +4,7 @@ import { maskCounterparty, useTxHistoryStore } from "../store/txHistoryStore";
 import type { TxHistoryEntry } from "../store/txHistoryStore";
 import { formatXlm } from "../lib/stealth";
 import { useWallet } from "../hooks/useWallet";
+import { useHistoryReconciliation } from "../hooks/useHistoryReconciliation";
 
 function formatDate(ts: number): string {
   try {
@@ -32,7 +33,15 @@ function typeLabel(kind: TxHistoryEntry["kind"]): string {
 }
 
 function statusFor(entry: TxHistoryEntry): string {
-  return entry.txHash ? "Confirmed" : "-";
+  if (!entry.txHash) return "-";
+  switch (entry.chainStatus) {
+    case "pending":
+      return "Pending";
+    case "failed":
+      return "Failed";
+    default:
+      return "Confirmed";
+  }
 }
 
 /** Token symbol badge for list display (icon-style: symbol only). */
@@ -71,6 +80,10 @@ function normalizeEntry(raw: unknown, index: number): TxHistoryEntry | null {
   const stealthAddress =
     typeof o.stealthAddress === "string" ? o.stealthAddress : undefined;
   const timestamp = typeof o.timestamp === "number" ? o.timestamp : Date.now();
+  const chainStatus =
+    o.chainStatus === "pending" || o.chainStatus === "failed" || o.chainStatus === "confirmed"
+      ? o.chainStatus
+      : undefined;
   const tokenSymbol = typeof o.tokenSymbol === "string" ? o.tokenSymbol : "XLM";
   const tokenAddress =
     o.tokenAddress != null && typeof o.tokenAddress === "string"
@@ -92,12 +105,15 @@ function normalizeEntry(raw: unknown, index: number): TxHistoryEntry | null {
     txHash,
     stealthAddress,
     timestamp,
+    chainStatus,
   };
 }
 
 export function TransactionHistoryView() {
-  const { cluster: walletCluster } = useWallet();
+  const { cluster: walletCluster, address } = useWallet();
   const cluster = walletCluster ?? getCluster();
+  const sync = useHistoryReconciliation({ cluster, address, autoOnEmpty: true });
+  const syncing = sync.status === "syncing";
   const byCluster = useTxHistoryStore((s) => s.byChain);
   const clear = useTxHistoryStore((s) => s.clear);
 
@@ -124,13 +140,34 @@ export function TransactionHistoryView() {
 
   return (
     <div className="w-full">
-      <div className="mb-8">
-        <h2 className="font-display text-2xl font-bold text-white">History</h2>
-        <p className="mt-1 text-sm text-mist">
-          Last 50 transactions on this network, including private sends,
-          withdrawals, and traits.
-        </p>
+      <div className="mb-8 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="font-display text-2xl font-bold text-white">History</h2>
+          <p className="mt-1 text-sm text-mist">
+            Last 50 transactions on this network, including private sends,
+            withdrawals, and traits.
+          </p>
+        </div>
+        {sync.canReconcile && (
+          <button
+            type="button"
+            onClick={() => void sync.reconcile()}
+            disabled={syncing}
+            className="rounded-xl border border-ink-600 bg-ink-950/30 px-4 py-2 text-sm font-medium text-mist transition-colors hover:border-white/30 hover:text-white disabled:opacity-50"
+          >
+            {syncing ? "Syncing…" : "Sync from chain"}
+          </button>
+        )}
       </div>
+
+      <p className="mb-4 min-h-4 text-xs text-mist/80" role="status" aria-live="polite">
+        {sync.status === "syncing" && "Rebuilding history from chain…"}
+        {sync.status === "done" &&
+          (sync.addedCount > 0
+            ? `Recovered ${sync.addedCount} transaction${sync.addedCount === 1 ? "" : "s"} from chain.`
+            : "History is up to date with chain.")}
+        {sync.status === "error" && `History sync failed: ${sync.error}`}
+      </p>
 
       {!safeEntries?.length ? (
         <div className="rounded-3xl border border-ink-700 bg-ink-900/25 p-10 text-center">
@@ -170,7 +207,15 @@ export function TransactionHistoryView() {
                   >
                     {typeLabel(tx.kind)}
                   </span>
-                  <span className="text-mist/70 text-xs shrink-0">
+                  <span
+                    className={`text-xs shrink-0 ${
+                      tx.chainStatus === "failed"
+                        ? "text-error"
+                        : tx.chainStatus === "pending"
+                          ? "text-warning"
+                          : "text-mist/70"
+                    }`}
+                  >
                     {statusFor(tx)}
                   </span>
                   <span

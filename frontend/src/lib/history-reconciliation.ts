@@ -73,13 +73,13 @@ export function reconcileHistory(
   const byHash = new Map<string, ReconciledEntry>();
   let dedupedCount = 0;
 
-  // Seed with local entries. We assume locally-stored entries are
-  // either user-authored (no chain status, treat as confirmed
-  // implicitly) or already-merged from a prior reconciliation
-  // (chain status not stored).
+  // Seed with local entries. Entries without a stored chain status are
+  // user-authored and treated as confirmed implicitly; entries recorded
+  // while still in flight keep their stored status (e.g. `pending`)
+  // until the chain says otherwise.
   for (const entry of local) {
     if (!entry.txHash) continue;
-    byHash.set(entry.txHash, { ...entry, chainStatus: "confirmed" });
+    byHash.set(entry.txHash, { ...entry, chainStatus: entry.chainStatus ?? "confirmed" });
   }
 
   let addedCount = 0;
