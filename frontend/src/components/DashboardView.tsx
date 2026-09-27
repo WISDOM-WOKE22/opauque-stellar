@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { FiInbox } from "react-icons/fi";
 import type { Tab } from "./Layout";
 import { ExplorerLink } from "./ExplorerLink";
@@ -10,6 +10,13 @@ import { maskCounterparty, useTxHistoryStore } from "../store/txHistoryStore";
 import type { TxHistoryEntry } from "../store/txHistoryStore";
 import { isTabNavVisible } from "../lib/tabAccess";
 import { getFeatureFlags } from "../lib/featureFlags";
+import { getHorizonServer } from "../lib/stellar";
+import { parseHorizonBalanceToStroops } from "../lib/decimalParser";
+import { formatXlm } from "../lib/stealth";
+import { unspentTotal } from "../lib/poolNotes";
+import { getPoolConfig } from "../contracts/poolConfig";
+import { useVaultStore } from "../store/vaultStore";
+import { usePoolNoteStore } from "../store/poolNoteStore";
 
 type DashboardViewProps = {
   onNavigate: (t: Tab) => void;
@@ -28,7 +35,7 @@ const ACTION_CARDS: {
     id: "send",
     icon: "↑",
     title: "Send",
-    subtitle: "Send XLM to any Stellar address",
+    subtitle: "Send XLM to a registered address or meta-address",
     accent: "glow",
   },
   {
@@ -48,6 +55,45 @@ const QUICK_LINKS: { id: Tab; label: string }[] = [
   { id: "manage" as Tab, label: "Manage" },
 ].filter((link) => isTabNavVisible(link.id));
 
+type WalletBalance =
+  | { status: "loading" }
+  | { status: "ok"; stroops: bigint }
+  | { status: "unfunded" }
+  | { status: "error" };
+
+/** Native XLM balance of the connected wallet, fetched from Horizon. */
+function useWalletBalance(address: string | undefined, cluster: string | null): WalletBalance | null {
+  const [balance, setBalance] = useState<WalletBalance | null>(null);
+
+  useEffect(() => {
+    if (!address) {
+      setBalance(null);
+      return;
+    }
+    let cancelled = false;
+    setBalance({ status: "loading" });
+    getHorizonServer()
+      .loadAccount(address)
+      .then((account) => {
+        if (cancelled) return;
+        const native = account.balances.find((b) => b.asset_type === "native") as
+          | { balance: string }
+          | undefined;
+        setBalance({ status: "ok", stroops: parseHorizonBalanceToStroops(native?.balance) });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const status = (err as { response?: { status?: number } })?.response?.status;
+        setBalance(status === 404 ? { status: "unfunded" } : { status: "error" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [address, cluster]);
+
+  return balance;
+}
+
 export function DashboardView({ onNavigate, address, cluster }: DashboardViewProps) {
   const [showSwitchModal, setShowSwitchModal] = useState(false);
   const manualGhostEnabled = getFeatureFlags().manualGhostAddresses;
@@ -58,6 +104,51 @@ export function DashboardView({ onNavigate, address, cluster }: DashboardViewPro
 
   const canChangeNetwork = cluster != null && isClusterSupported(cluster as StellarNetwork);
   const byChain = useTxHistoryStore((s) => s.byChain);
+  const walletBalance = useWalletBalance(address, cluster);
+  const vaultEntries = useVaultStore((s) => s.entries);
+  const stealthEntries = vaultEntries.filter((e) => !e.isSpent);
+  const stealthTotal = stealthEntries.reduce((sum, e) => sum + e.amountStroops, 0n);
+  const poolNotes = usePoolNoteStore((s) => s.notes);
+  const poolId = cluster != null ? getPoolConfig()?.poolId : undefined;
+  const unspentPoolNotes =
+    cluster != null
+      ? poolNotes.filter(
+          (n) => n.cluster === cluster && !n.spent && (!n.poolId || n.poolId === poolId),
+        )
+      : [];
+  const poolTotal = unspentTotal(unspentPoolNotes);
+
+  const walletValue =
+    walletBalance == null
+      ? "-"
+      : walletBalance.status === "loading"
+        ? "…"
+        : walletBalance.status === "ok"
+          ? `${formatXlm(walletBalance.stroops)} XLM`
+          : walletBalance.status === "unfunded"
+            ? "0 XLM"
+            : "Unavailable";
+
+  const balanceCards: { id?: Tab; label: string; value: string; hint: string }[] = [
+    {
+      label: "Wallet",
+      value: walletValue,
+      hint: walletBalance?.status === "unfunded" ? "Account not funded" : "Public XLM balance",
+    },
+    {
+      id: "balance" as Tab,
+      label: "Stealth",
+      value: `${formatXlm(stealthTotal)} XLM`,
+      hint: `${stealthEntries.length} address${stealthEntries.length === 1 ? "" : "es"} · as of last scan`,
+    },
+    {
+      id: "pool" as Tab,
+      label: "Privacy pool",
+      value: `${formatXlm(poolTotal)} XLM`,
+      hint: `${unspentPoolNotes.length} unspent note${unspentPoolNotes.length === 1 ? "" : "s"}`,
+    },
+  ];
+
   const recentHistory: TxHistoryEntry[] = cluster != null ? (byChain[cluster] ?? []).slice(0, 4) : [];
 
   const formatDate = (ts: number): string => {
@@ -100,6 +191,40 @@ export function DashboardView({ onNavigate, address, cluster }: DashboardViewPro
           </div>
         )}
       </div>
+
+      {/* ── Balance summary ── */}
+      <section className="mb-6" aria-label="Balance summary">
+        <div className="grid gap-3 sm:grid-cols-3">
+          {balanceCards.map((card) => {
+            const target = card.id != null && isTabNavVisible(card.id) ? card.id : null;
+            const content = (
+              <>
+                <p className="text-xs font-semibold uppercase tracking-widest text-mist/70">{card.label}</p>
+                <p className="mt-1 truncate font-display text-xl font-bold text-white" title={card.value}>
+                  {card.value}
+                </p>
+                <p className="mt-1 text-xs text-mist/60">{card.hint}</p>
+              </>
+            );
+            const className =
+              "rounded-2xl border border-ink-600 bg-ink-900/25 px-5 py-4 text-left";
+            return target ? (
+              <button
+                key={card.label}
+                type="button"
+                onClick={() => onNavigate(target)}
+                className={`${className} transition-colors hover:border-glow/40`}
+              >
+                {content}
+              </button>
+            ) : (
+              <div key={card.label} className={className}>
+                {content}
+              </div>
+            );
+          })}
+        </div>
+      </section>
 
       {/* ── Primary action cards ── */}
       <div className="grid gap-4 sm:grid-cols-2">
